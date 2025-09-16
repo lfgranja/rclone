@@ -257,3 +257,21 @@ func (opt *Options) Init() {
 	// Make sure links are returned as links
 	opt.LinkPerms |= FileMode(os.ModeSymlink)
 }
+
+// FileStatus represents the cache status of a file
+type FileStatus struct {
+	Path     string `json:"path"`     // Path to the file
+	Status   string `json:"status"`   // Cache status: "cached", "not_cached", "error"
+	Size     int64  `json:"size"`     // Size of the file in bytes
+	ModTime  string `json:"modTime"`  // Modification time as ISO 8601 string
+}
+
+// DirStatusList represents a list of file statuses in a directory
+type DirStatusList []FileStatus
+
+// Cache status constants
+const (
+	StatusCached    = "cached"
+	StatusNotCached = "not_cached"
+	StatusError     = "error"
+)

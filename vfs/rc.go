@@ -665,14 +665,50 @@ func rcQueueSetExpiry(ctx context.Context, in rc.Params) (out rc.Params, err err
 	return nil, err
 }
 
+<<<<<<< HEAD
 // rcFileStatus gets the cache status for a single file.
 // It takes the VFS instance and the file path as parameters.
 // It returns a FileStatus object containing the file's caching details.
+=======
+func init() {
+	rc.Add(rc.Call{
+		Path:  "vfs/file-status",
+		Fn:    rcFileStatus,
+		Title: "Get cache status of a file.",
+		Help: `This gets the cache status of a single file.
+
+This takes the following parameters:
+- |fs| - select the VFS in use (optional)
+- |path| - path to the file
+
+This returns a FileStatus object with the cache status information.
+`,
+	})
+	rc.Add(rc.Call{
+		Path:  "vfs/dir-status",
+		Fn:    rcDirStatus,
+		Title: "Get cache status of files in a directory.",
+		Help: `This gets the cache status of all files in a directory.
+
+This takes the following parameters:
+- |fs| - select the VFS in use (optional)
+- |path| - path to the directory
+
+This returns a DirStatusList object containing FileStatus objects for all files in the directory.
+`,
+	})
+}
+
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	vfs, err := getVFS(in)
 	if err != nil {
 		return nil, err
 	}
+<<<<<<< HEAD
+=======
+
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	path, err := in.GetString("path")
 	if err != nil {
 		return nil, err
@@ -683,26 +719,54 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 		return nil, err
 	}
 
+<<<<<<< HEAD
 	return rc.Params{"status": status}, nil
 }
 
 // rcDirStatus gets the cache status for files in a directory.
 // It takes the VFS instance and the directory path as parameters.
 // It returns a list of FileStatus objects for all files within the directory.
+=======
+	return rc.Params{
+		"path":     status.Path,
+		"status":   status.Status,
+		"size":     status.Size,
+		"modTime":  status.ModTime,
+	}, nil
+}
+
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 func rcDirStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	vfs, err := getVFS(in)
 	if err != nil {
 		return nil, err
 	}
+<<<<<<< HEAD
 	dirPath, err := in.GetString("dir")
+=======
+
+	path, err := in.GetString("path")
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	if err != nil {
 		return nil, err
 	}
 
+<<<<<<< HEAD
 	dirStatus, err := vfs.GetDirStatus(dirPath)
+=======
+	statusList, err := vfs.GetDirStatus(path)
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	if err != nil {
 		return nil, err
 	}
 
+<<<<<<< HEAD
 	return rc.Params{"dirStatus": dirStatus}, nil
 }
+=======
+	return rc.Params{
+		"files": statusList,
+	}, nil
+}
+
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)

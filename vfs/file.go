@@ -549,6 +549,36 @@ func (f *File) SetModTime(modTime time.Time) error {
 	return nil
 }
 
+// GetStatus returns the cache status of the file
+func (f *File) GetStatus() *vfscommon.FileStatus {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	
+	status := &vfscommon.FileStatus{
+		Path:    f.Path(),
+		Size:    f.size.Load(),
+		ModTime: "", // Will be set if mod time is available
+	}
+	
+	// Determine cache status
+	if f.o == nil {
+		// File is being written and not yet valid
+		status.Status = vfscommon.StatusNotCached
+		return status
+	}
+	
+	// Check if file is in cache
+	// For now, we consider a file cached if it has a valid object
+	// This could be enhanced later to check actual cache presence
+	status.Status = vfscommon.StatusCached
+	
+	// Set mod time if available
+	if modTime := f.ModTime(); !modTime.IsZero() {
+		status.ModTime = modTime.Format(time.RFC3339)
+	}
+	
+	return status
+}
 // Apply a pending mod time
 // Call with the mutex held
 func (f *File) _applyPendingModTime() error {

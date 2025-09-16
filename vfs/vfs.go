@@ -988,40 +988,73 @@ func (vfs *VFS) isMetadataFile(name string) (rawName string, found bool) {
 	return rawName, found
 }
 
+<<<<<<< HEAD
 // GetFileStatus retrieves the caching status of a single file.
+=======
+// GetFileStatus retrieves the cache status of a single file.
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 // It takes the file path as a parameter.
 // It returns a FileStatus object containing the file's caching details.
 func (vfs *VFS) GetFileStatus(path string) (*vfscommon.FileStatus, error) {
 	node, err := vfs.Stat(path)
 	if err != nil {
+<<<<<<< HEAD
 		return nil, err
 	}
 	if node.IsDir() {
 		return nil, fmt.Errorf("path is a directory, not a file")
+=======
+		return &vfscommon.FileStatus{
+			Path:   path,
+			Status: vfscommon.StatusError,
+		}, nil
+	}
+	if node.IsDir() {
+		return &vfscommon.FileStatus{
+			Path:   path,
+			Status: vfscommon.StatusError,
+		}, fmt.Errorf("path is a directory, not a file")
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	}
 	file := node.(*File)
 	return file.GetStatus(), nil
 }
 
+<<<<<<< HEAD
 // GetDirStatus retrieves the caching status of all files in a directory.
+=======
+// GetDirStatus retrieves the cache status of all files in a directory.
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 // It takes the directory path as a parameter.
 // It returns a DirStatusList (slice of FileStatus) containing caching details for files in the directory.
 func (vfs *VFS) GetDirStatus(path string) (vfscommon.DirStatusList, error) {
 	node, err := vfs.Stat(path)
 	if err != nil {
+<<<<<<< HEAD
 		return vfscommon.DirStatusList{}, errors.New("no DirStatus value available")
+=======
+		return vfscommon.DirStatusList{}, err
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	}
 	if !node.IsDir() {
 		return vfscommon.DirStatusList{}, fmt.Errorf("path is a file, not a directory")
 	}
 	dir := node.(*Dir)
 
+<<<<<<< HEAD
 	items, err := dir.ReadDirAll()
+=======
+	items, err := ddir.ReadDirAll()
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	if err != nil {
 		return vfscommon.DirStatusList{}, err
 	}
 
+<<<<<<< HEAD
 	var statusList []vfscommon.FileStatus
+=======
+	var statusList vfscommon.DirStatusList
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 	for _, itemNode := range items {
 		if !itemNode.IsDir() {
 			file := itemNode.(*File)
@@ -1029,5 +1062,9 @@ func (vfs *VFS) GetDirStatus(path string) (vfscommon.DirStatusList, error) {
 		}
 	}
 
+<<<<<<< HEAD
 	return vfscommon.DirStatusList(statusList), nil
+=======
+	return statusList, nil
+>>>>>>> 1b08af40e (feat(vfs): Add VFS cache status API)
 }

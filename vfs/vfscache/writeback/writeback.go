@@ -309,12 +309,15 @@ func (wb *WriteBack) Remove(id Handle) (found bool) {
 	return wb._remove(id)
 }
 
-// Get returns a writeback item by handle if it exists
-func (wb *WriteBack) Get(id Handle) *writeBackItem {
+// IsUploading returns true if the item is currently being uploaded
+func (wb *WriteBack) IsUploading(id Handle) bool {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
 
-	return wb.lookup[id]
+	if wbItem, ok := wb.lookup[id]; ok {
+		return wbItem.uploading
+	}
+	return false
 }
 
 // IsUploading returns true if the item is currently being uploaded

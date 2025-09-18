@@ -20,6 +20,3 @@ __pycache__
 .DS_Store
 resource_windows_*.syso
 .devcontainer
-GEMINI.md
-ISSUE8779-TODO.md
-LLXPRT.md

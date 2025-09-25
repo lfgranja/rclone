@@ -395,26 +395,63 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	if err != nil {
 		return nil, err
 	}
-	path, err := in.GetString("path")
-	if err != nil {
+	
+	// Support both single file and multiple files
+	var paths []string
+	
+	// Check for "path" parameter (single file)
+	if path, err := in.GetString("path"); err == nil {
+		paths = []string{path}
+	} else if !rc.IsErrParamNotFound(err) {
 		return nil, err
+	} else {
+		// Check for multiple path parameters (path1, path2, etc.)
+		for i := 1; ; i++ {
+			key := "path" + strconv.Itoa(i)
+			path, pathErr := in.GetString(key)
+			if pathErr != nil {
+				if rc.IsErrParamNotFound(pathErr) {
+					break // No more path parameters
+				}
+				return nil, pathErr
+			}
+			paths = append(paths, path)
+		}
+		
+		// If no paths found, return error
+		if len(paths) == 0 {
+			return nil, errors.New("no path parameter(s) provided")
+		}
 	}
-	if vfs.cache == nil {
-		return rc.Params{
+	
+	// Collect status for each file
+	var results []rc.Params
+	for _, path := range paths {
+		if vfs.cache == nil {
+			results = append(results, rc.Params{
 				"name":       filepath.Base(path),
 				"status":     "NONE",
 				"percentage": 0,
-			},
-			nil
+			})
+		} else {
+			item := vfs.cache.Item(path)
+			status, percentage := item.VFSStatusCacheWithPercentage()
+			results = append(results, rc.Params{
+				"name":       filepath.Base(path),
+				"status":     status,
+				"percentage": percentage,
+			})
+		}
 	}
-	item := vfs.cache.Item(path)
-	status, percentage := item.VFSStatusCacheWithPercentage()
+	
+	// Return single result for backward compatibility if only one path
+	if len(results) == 1 {
+		return results[0], nil
+	}
+	
 	return rc.Params{
-			"name":       filepath.Base(path),
-			"status":     status,
-			"percentage": percentage,
-		},
-		nil
+		"files": results,
+	}, nil
 }
 
 func rcStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
@@ -422,24 +459,33 @@ func rcStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if err != nil {
 		return nil, err
 	}
-	path, err := in.GetString("path")
-	if err != nil {
-		return nil, err
-	}
+	
 	if vfs.cache == nil {
 		return rc.Params{
-				"status":     "NONE",
-				"percentage": 0,
-			},
-			nil
+			"totalFiles":           0,
+			"fullCount":            0,
+			"partialCount":         0,
+			"noneCount":            0,
+			"dirtyCount":           0,
+			"uploadingCount":       0,
+			"totalCachedBytes":     0,
+			"averageCachePercentage": 0,
+		}, nil
 	}
-	item := vfs.cache.Item(path)
-	status, percentage := item.VFSStatusCacheWithPercentage()
+	
+	// Get aggregate statistics from cache
+	stats := vfs.cache.GetAggregateStats()
+	
 	return rc.Params{
-			"status":     status,
-			"percentage": percentage,
-		},
-		nil
+		"totalFiles":           stats.TotalFiles,
+		"fullCount":            stats.FullCount,
+		"partialCount":         stats.PartialCount,
+		"noneCount":            stats.NoneCount,
+		"dirtyCount":           stats.DirtyCount,
+		"uploadingCount":       stats.UploadingCount,
+		"totalCachedBytes":     stats.TotalCachedBytes,
+		"averageCachePercentage": stats.AverageCachePercentage,
+	}, nil
 }
 
 func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {

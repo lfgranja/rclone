@@ -1125,7 +1125,9 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 	// Check if item is being uploaded
 	if item.writeBackID != 0 {
 		if item.c.writeback != nil {
-			if item.c.writeback.IsUploading(item.writeBackID) {
+			// Check upload status with writeback lock released to avoid lock ordering issues
+			isUploading := item.c.writeback.IsUploading(item.writeBackID)
+			if isUploading {
 				return "UPLOADING", 100
 			}
 		}

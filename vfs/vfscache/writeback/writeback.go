@@ -320,11 +320,6 @@ func (wb *WriteBack) IsUploading(id Handle) bool {
 	return false
 }
 
-// IsUploading returns true if the item is currently being uploaded
-func (wbItem *writeBackItem) IsUploading() bool {
-	return wbItem.uploading
-}
-
 // Rename should be called when a file might be uploading and it gains
 // a new name. This will cancel the upload and put it back in the
 // queue.

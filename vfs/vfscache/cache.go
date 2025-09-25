@@ -899,3 +899,59 @@ func (c *Cache) AddVirtual(remote string, size int64, isDir bool) error {
 	}
 	return c.avFn(remote, size, isDir)
 }
+
+// CacheStats holds aggregate cache statistics
+type CacheStats struct {
+	TotalFiles           int `json:"totalFiles"`
+	FullCount            int `json:"fullCount"`
+	PartialCount         int `json:"partialCount"`
+	NoneCount            int `json:"noneCount"`
+	DirtyCount           int `json:"dirtyCount"`
+	UploadingCount       int `json:"uploadingCount"`
+	TotalCachedBytes     int64 `json:"totalCachedBytes"`
+	AverageCachePercentage int  `json:"averageCachePercentage"`
+}
+
+// GetAggregateStats returns aggregate cache statistics
+func (c *Cache) GetAggregateStats() CacheStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stats := CacheStats{
+		TotalFiles:       len(c.item),
+		TotalCachedBytes: 0,
+	}
+
+	if stats.TotalFiles == 0 {
+		return stats
+	}
+
+	var totalPercentage int
+
+	for _, item := range c.item {
+		status, percentage := item.VFSStatusCacheWithPercentage()
+		
+		switch status {
+		case "FULL":
+			stats.FullCount++
+		case "PARTIAL":
+			stats.PartialCount++
+		case "NONE":
+			stats.NoneCount++
+		case "DIRTY":
+			stats.DirtyCount++
+		case "UPLOADING":
+			stats.UploadingCount++
+		}
+
+		stats.TotalCachedBytes += item.getDiskSize()
+		totalPercentage += percentage
+	}
+
+	// Calculate average percentage
+	if stats.TotalFiles > 0 {
+		stats.AverageCachePercentage = totalPercentage / stats.TotalFiles
+	}
+
+	return stats
+}

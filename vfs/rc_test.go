@@ -25,40 +25,122 @@ func TestRCStatus(t *testing.T) {
 	// Add VFS to active cache
 	addToActiveCache(vfs)
 
-	// Test vfs/status endpoint
+	// Test vfs/status endpoint (aggregate statistics)
 	statusCall := rc.Calls.Get("vfs/status")
 	require.NotNil(t, statusCall)
 
-	// Test with valid file path
+	// Test aggregate stats
 	result, err := statusCall.Fn(context.Background(), rc.Params{
-		"fs":   r.Fremote.String(),
-		"path": "test.txt",
+		"fs": r.Fremote.String(),
 	})
 	require.NoError(t, err)
 
-	status, ok := result["status"].(string)
-	require.True(t, ok)
-	assert.Contains(t, []string{"FULL", "PARTIAL", "NONE"}, status)
+	// Check that we have the expected aggregate stats
+	// Note: RC system may convert int64 to int in some cases
+	totalFilesVal, ok := result["totalFiles"]
+	require.True(t, ok, "totalFiles not found in result")
+	totalFiles := int64(0)
+	switch v := totalFilesVal.(type) {
+	case int64:
+		totalFiles = v
+	case int:
+		totalFiles = int64(v)
+	default:
+		require.Fail(t, "totalFiles is not int64 or int, got %T", totalFilesVal)
+	}
+	assert.GreaterOrEqual(t, totalFiles, int64(0))
 
-	percentage, ok := result["percentage"].(int)
-	require.True(t, ok)
-	assert.GreaterOrEqual(t, percentage, 0)
-	assert.LessOrEqual(t, percentage, 100)
+	fullCountVal, ok := result["fullCount"]
+	require.True(t, ok, "fullCount not found in result")
+	fullCount := int64(0)
+	switch v := fullCountVal.(type) {
+	case int64:
+		fullCount = v
+	case int:
+		fullCount = int64(v)
+	default:
+		require.Fail(t, "fullCount is not int64 or int, got %T", fullCountVal)
+	}
+	assert.GreaterOrEqual(t, fullCount, int64(0))
 
-	// Test with non-existent file
-	result, err = statusCall.Fn(context.Background(), rc.Params{
-		"fs":   r.Fremote.String(),
-		"path": "nonexistent.txt",
-	})
-	require.NoError(t, err)
+	partialCountVal, ok := result["partialCount"]
+	require.True(t, ok, "partialCount not found in result")
+	partialCount := int64(0)
+	switch v := partialCountVal.(type) {
+	case int64:
+		partialCount = v
+	case int:
+		partialCount = int64(v)
+	default:
+		require.Fail(t, "partialCount is not int64 or int, got %T", partialCountVal)
+	}
+	assert.GreaterOrEqual(t, partialCount, int64(0))
 
-	status, ok = result["status"].(string)
-	require.True(t, ok)
-	assert.Equal(t, "NONE", status)
+	noneCountVal, ok := result["noneCount"]
+	require.True(t, ok, "noneCount not found in result")
+	noneCount := int64(0)
+	switch v := noneCountVal.(type) {
+	case int64:
+		noneCount = v
+	case int:
+		noneCount = int64(v)
+	default:
+		require.Fail(t, "noneCount is not int64 or int, got %T", noneCountVal)
+	}
+	assert.GreaterOrEqual(t, noneCount, int64(0))
 
-	percentage, ok = result["percentage"].(int)
-	require.True(t, ok)
-	assert.Equal(t, 0, percentage)
+	dirtyCountVal, ok := result["dirtyCount"]
+	require.True(t, ok, "dirtyCount not found in result")
+	dirtyCount := int64(0)
+	switch v := dirtyCountVal.(type) {
+	case int64:
+		dirtyCount = v
+	case int:
+		dirtyCount = int64(v)
+	default:
+		require.Fail(t, "dirtyCount is not int64 or int, got %T", dirtyCountVal)
+	}
+	assert.GreaterOrEqual(t, dirtyCount, int64(0))
+
+	uploadingCountVal, ok := result["uploadingCount"]
+	require.True(t, ok, "uploadingCount not found in result")
+	uploadingCount := int64(0)
+	switch v := uploadingCountVal.(type) {
+	case int64:
+		uploadingCount = v
+	case int:
+		uploadingCount = int64(v)
+	default:
+		require.Fail(t, "uploadingCount is not int64 or int, got %T", uploadingCountVal)
+	}
+	assert.GreaterOrEqual(t, uploadingCount, int64(0))
+
+	totalCachedBytesVal, ok := result["totalCachedBytes"]
+	require.True(t, ok, "totalCachedBytes not found in result")
+	totalCachedBytes := int64(0)
+	switch v := totalCachedBytesVal.(type) {
+	case int64:
+		totalCachedBytes = v
+	case int:
+		totalCachedBytes = int64(v)
+	default:
+		require.Fail(t, "totalCachedBytes is not int64 or int, got %T", totalCachedBytesVal)
+	}
+	assert.GreaterOrEqual(t, totalCachedBytes, int64(0))
+
+	averageCachePercentageVal, ok := result["averageCachePercentage"]
+	require.True(t, ok, "averageCachePercentage not found in result")
+	averageCachePercentage := int64(0)
+	switch v := averageCachePercentageVal.(type) {
+	case int64:
+		averageCachePercentage = v
+	case int:
+		averageCachePercentage = int64(v)
+	default:
+		require.Fail(t, "averageCachePercentage is not int64 or int, got %T", averageCachePercentageVal)
+	}
+	assert.GreaterOrEqual(t, averageCachePercentage, int64(0))
+	assert.LessOrEqual(t, averageCachePercentage, int64(100))
 }
 
 func TestRCFileStatus(t *testing.T) {

@@ -1123,13 +1123,15 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 	defer item.mu.Unlock()
 
 	// Check if item is being uploaded
-	if item.writeBackID != 0 {
-		if item.c.writeback != nil {
-			// Check upload status with writeback lock released to avoid lock ordering issues
-			isUploading := item.c.writeback.IsUploading(item.writeBackID)
-			if isUploading {
-				return "UPLOADING", 100
-			}
+	if item.writeBackID != 0 && item.c.writeback != nil {
+		// Check upload status with item lock released to avoid lock ordering issues
+		writeBackID := item.writeBackID
+		wb := item.c.writeback
+		item.mu.Unlock()
+		isUploading := wb.IsUploading(writeBackID)
+		item.mu.Lock()
+		if isUploading {
+			return "UPLOADING", 100
 		}
 	}
 

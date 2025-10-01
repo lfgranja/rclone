@@ -89,9 +89,9 @@ This returns detailed cache status of files including name and percentage.
 This takes the following parameters:
 
 - fs - select the VFS in use (optional)
-- path - the path to the file to get the status of
+- path - the path to the file to get the status of. Use path, path1, path2 etc for multiple files.
 
-This returns a JSON object with the following fields:
+This returns a JSON object with the following fields (or an object with a "files" key if multiple files are requested):
 
 - name - leaf name of the file
 - status - one of "FULL", "PARTIAL", "NONE", "DIRTY", "UPLOADING"
@@ -111,7 +111,7 @@ This takes the following parameters:
 - fs - select the VFS in use (optional)
 - dir - the path to the directory to get the status of
 
-This returns a JSON array with the following fields for each file:
+This returns a JSON object with a "files" key which is an array of file status objects:
 
 - name - leaf name of the file
 - status - one of "FULL", "PARTIAL", "NONE", "DIRTY", "UPLOADING"
@@ -330,23 +330,14 @@ func rcDirStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	// Navigate to the target directory
 	targetDir := root
 	if dirPath != "" {
-		dirPath = strings.Trim(dirPath, "/")
-		segments := strings.Split(dirPath, "/")
-		var node Node = targetDir
-		for _, s := range segments {
-			if dir, ok := node.(*Dir); ok {
-				node, err = dir.stat(s)
-				if err != nil {
-					return nil, fmt.Errorf("directory not found: %w", err)
-				}
-			} else {
-				return nil, fmt.Errorf("path component is not a directory: %s", s)
-			}
+		node, err := vfs.Stat(dirPath)
+		if err != nil {
+			return nil, fmt.Errorf("directory not found: %w", err)
 		}
-		if dir, ok := node.(*Dir); ok {
-			targetDir = dir
-		} else {
-			return nil, fmt.Errorf("target path is not a directory")
+		var ok bool
+		targetDir, ok = node.(*Dir)
+		if !ok {
+			return nil, fmt.Errorf("target path %q is not a directory", dirPath)
 		}
 	}
 
@@ -395,10 +386,10 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Support both single file and multiple files
 	var paths []string
-	
+
 	// Check for "path" parameter (single file)
 	if path, err := in.GetString("path"); err == nil {
 		paths = []string{path}
@@ -417,13 +408,13 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 			}
 			paths = append(paths, path)
 		}
-		
+
 		// If no paths found, return error
 		if len(paths) == 0 {
 			return nil, errors.New("no path parameter(s) provided")
 		}
 	}
-	
+
 	// Collect status for each file
 	var results []rc.Params
 	for _, path := range paths {
@@ -443,12 +434,12 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 			})
 		}
 	}
-	
+
 	// Return single result for backward compatibility if only one path
 	if len(results) == 1 {
 		return results[0], nil
 	}
-	
+
 	return rc.Params{
 		"files": results,
 	}, nil
@@ -459,31 +450,31 @@ func rcStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if vfs.cache == nil {
 		return rc.Params{
-			"totalFiles":           0,
-			"fullCount":            0,
-			"partialCount":         0,
-			"noneCount":            0,
-			"dirtyCount":           0,
-			"uploadingCount":       0,
-			"totalCachedBytes":     0,
+			"totalFiles":             0,
+			"fullCount":              0,
+			"partialCount":           0,
+			"noneCount":              0,
+			"dirtyCount":             0,
+			"uploadingCount":         0,
+			"totalCachedBytes":       0,
 			"averageCachePercentage": 0,
 		}, nil
 	}
-	
+
 	// Get aggregate statistics from cache
 	stats := vfs.cache.GetAggregateStats()
-	
+
 	return rc.Params{
-		"totalFiles":           stats.TotalFiles,
-		"fullCount":            stats.FullCount,
-		"partialCount":         stats.PartialCount,
-		"noneCount":            stats.NoneCount,
-		"dirtyCount":           stats.DirtyCount,
-		"uploadingCount":       stats.UploadingCount,
-		"totalCachedBytes":     stats.TotalCachedBytes,
+		"totalFiles":             stats.TotalFiles,
+		"fullCount":              stats.FullCount,
+		"partialCount":           stats.PartialCount,
+		"noneCount":              stats.NoneCount,
+		"dirtyCount":             stats.DirtyCount,
+		"uploadingCount":         stats.UploadingCount,
+		"totalCachedBytes":       stats.TotalCachedBytes,
 		"averageCachePercentage": stats.AverageCachePercentage,
 	}, nil
 }

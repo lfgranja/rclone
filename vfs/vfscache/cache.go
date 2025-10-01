@@ -902,14 +902,14 @@ func (c *Cache) AddVirtual(remote string, size int64, isDir bool) error {
 
 // CacheStats holds aggregate cache statistics
 type CacheStats struct {
-	TotalFiles           int `json:"totalFiles"`
-	FullCount            int `json:"fullCount"`
-	PartialCount         int `json:"partialCount"`
-	NoneCount            int `json:"noneCount"`
-	DirtyCount           int `json:"dirtyCount"`
-	UploadingCount       int `json:"uploadingCount"`
-	TotalCachedBytes     int64 `json:"totalCachedBytes"`
-	AverageCachePercentage int  `json:"averageCachePercentage"`
+	TotalFiles             int   `json:"totalFiles"`
+	FullCount              int   `json:"fullCount"`
+	PartialCount           int   `json:"partialCount"`
+	NoneCount              int   `json:"noneCount"`
+	DirtyCount             int   `json:"dirtyCount"`
+	UploadingCount         int   `json:"uploadingCount"`
+	TotalCachedBytes       int64 `json:"totalCachedBytes"`
+	AverageCachePercentage int   `json:"averageCachePercentage"`
 }
 
 // GetAggregateStats returns aggregate cache statistics
@@ -930,7 +930,7 @@ func (c *Cache) GetAggregateStats() CacheStats {
 
 	for _, item := range c.item {
 		status, percentage := item.VFSStatusCacheWithPercentage()
-		
+
 		switch status {
 		case "FULL":
 			stats.FullCount++

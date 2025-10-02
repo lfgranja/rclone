@@ -392,27 +392,27 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 
 	// Check for "path" parameter (single file)
 	if path, err := in.GetString("path"); err == nil {
-		paths = []string{path}
+		paths = append(paths, path)
 	} else if !rc.IsErrParamNotFound(err) {
 		return nil, err
-	} else {
-		// Check for multiple path parameters (path1, path2, etc.)
-		for i := 1; ; i++ {
-			key := "path" + strconv.Itoa(i)
-			path, pathErr := in.GetString(key)
-			if pathErr != nil {
-				if rc.IsErrParamNotFound(pathErr) {
-					break // No more path parameters
-				}
-				return nil, pathErr
-			}
-			paths = append(paths, path)
-		}
+	}
 
-		// If no paths found, return error
-		if len(paths) == 0 {
-			return nil, errors.New("no path parameter(s) provided")
+	// Check for multiple path parameters (path1, path2, etc.)
+	for i := 1; ; i++ {
+		key := "path" + strconv.Itoa(i)
+		path, pathErr := in.GetString(key)
+		if pathErr != nil {
+			if rc.IsErrParamNotFound(pathErr) {
+				break // No more path parameters
+			}
+			return nil, pathErr
 		}
+		paths = append(paths, path)
+	}
+
+	// If no paths found, return error
+	if len(paths) == 0 {
+		return nil, errors.New("no path parameter(s) provided")
 	}
 
 	// Collect status for each file

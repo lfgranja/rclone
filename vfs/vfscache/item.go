@@ -1130,7 +1130,8 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 		item.mu.Unlock()
 		isUploading := wb.IsUploading(writeBackID)
 		item.mu.Lock()
-		if isUploading {
+		// Re-check that the writeBackID hasn't changed while we released the lock
+		if isUploading && item.writeBackID == writeBackID {
 			return "UPLOADING", 100
 		}
 	}
@@ -1150,6 +1151,9 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 
 	if totalSize <= 0 {
 		if cachedSize > 0 {
+			// Can't calculate percentage when total size is unknown, so return 99% to indicate
+			// that the file is partially cached but we can't determine the exact percentage.
+			// This prevents confusion with a FULL status (100%).
 			return "PARTIAL", 99
 		}
 		return "NONE", 0
@@ -1160,6 +1164,9 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 	}
 	if cachedSize > 0 {
 		percentage := int((cachedSize * 100) / totalSize)
+		if percentage > 99 {
+			percentage = 99
+		}
 		return "PARTIAL", percentage
 	}
 

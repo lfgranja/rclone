@@ -320,6 +320,15 @@ func rcDirStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if err != nil && !rc.IsErrParamNotFound(err) {
 		return nil, err
 	}
+	
+	// Remove processed parameters and reject any unexpected ones
+	delete(in, "fs") // getVFS removes "fs" key if present
+	delete(in, "dir") // Always remove "dir" parameter whether empty or not
+	if len(in) != 0 {
+		for k, v := range in {
+			return nil, fmt.Errorf("invalid parameter: %s=%v", k, v)
+		}
+	}
 
 	// Get root directory
 	root, err := vfs.Root()

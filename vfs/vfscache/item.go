@@ -1120,7 +1120,6 @@ func (item *Item) VFSStatusCache() string {
 // Returns status string and percentage (0-100).
 func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 	item.mu.Lock()
-	defer item.mu.Unlock()
 
 	// Check if item is being uploaded
 	if item.writeBackID != 0 && item.c.writeback != nil {
@@ -1132,17 +1131,20 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 		item.mu.Lock()
 		// Re-check that the writeBackID hasn't changed while we released the lock
 		if isUploading && item.writeBackID == writeBackID {
+			item.mu.Unlock()
 			return "UPLOADING", 100
 		}
 	}
 
 	// Check if item is dirty (modified but not uploaded yet)
 	if item.info.Dirty {
+		item.mu.Unlock()
 		return "DIRTY", 100
 	}
 
 	// Check cache status
 	if item._present() {
+		item.mu.Unlock()
 		return "FULL", 100
 	}
 
@@ -1150,6 +1152,7 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 	totalSize := item.info.Size
 
 	if totalSize <= 0 {
+		item.mu.Unlock()
 		if cachedSize > 0 {
 			// Can't calculate percentage when total size is unknown, so return 99% to indicate
 			// that the file is partially cached but we can't determine the exact percentage.
@@ -1160,16 +1163,19 @@ func (item *Item) VFSStatusCacheWithPercentage() (string, int) {
 	}
 
 	if cachedSize >= totalSize {
+		item.mu.Unlock()
 		return "FULL", 100
 	}
 	if cachedSize > 0 {
 		percentage := int((cachedSize * 100) / totalSize)
+		item.mu.Unlock()
 		if percentage > 99 {
 			percentage = 99
 		}
 		return "PARTIAL", percentage
 	}
 
+	item.mu.Unlock()
 	return "NONE", 0
 }
 
@@ -1522,15 +1528,4 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	}
 	item.c.writeback.Rename(id, newName)
 	return err
-}
-
-// GetStatusAndSize returns the cache status, percentage, and disk size in a single call
-// to reduce lock contention when called from GetAggregateStats
-func (item *Item) GetStatusAndSize() (status string, percentage int, diskSize int64) {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-
-	status, percentage = item.VFSStatusCacheWithPercentage()
-	diskSize = item.getDiskSize()
-	return
 }

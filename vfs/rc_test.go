@@ -93,8 +93,18 @@ func TestRCFileStatus(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, []string{"FULL", "PARTIAL", "NONE"}, status)
 
-	percentage, ok := result["percentage"].(int)
-	require.True(t, ok)
+	// Handle different numeric types that might be returned from JSON
+	var percentage int
+	switch v := result["percentage"].(type) {
+	case int:
+		percentage = v
+	case int64:
+		percentage = int(v)
+	case float64:
+		percentage = int(v)
+	default:
+		require.Fail(t, "percentage is not a recognized numeric type, got %T", result["percentage"])
+	}
 	assert.GreaterOrEqual(t, percentage, 0)
 	assert.LessOrEqual(t, percentage, 100)
 
@@ -243,8 +253,10 @@ func getInt64FromParam(t *testing.T, params rc.Params, key string) int64 {
 		i64 = v
 	case int:
 		i64 = int64(v)
+	case float64:
+		i64 = int64(v)
 	default:
-		require.Fail(t, "%s is not int64 or int, got %T", key, val)
+		require.Fail(t, "%s is not int64, int, or float64, got %T", key, val)
 	}
 	return i64
 }

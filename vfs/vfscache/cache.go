@@ -929,7 +929,7 @@ func (c *Cache) GetAggregateStats() CacheStats {
 	var totalPercentage int
 
 	for _, item := range c.item {
-		status, percentage := item.VFSStatusCacheWithPercentage()
+		status, percentage, diskSize := item.GetStatusAndSize()
 
 		switch status {
 		case "FULL":
@@ -944,7 +944,7 @@ func (c *Cache) GetAggregateStats() CacheStats {
 			stats.UploadingCount++
 		}
 
-		stats.TotalCachedBytes += item.getDiskSize()
+		stats.TotalCachedBytes += diskSize
 		totalPercentage += percentage
 	}
 

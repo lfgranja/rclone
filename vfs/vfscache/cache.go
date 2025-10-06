@@ -914,23 +914,25 @@ type CacheStats struct {
 
 // GetAggregateStats returns aggregate cache statistics
 func (c *Cache) GetAggregateStats() CacheStats {
+	// Snapshot items under cache lock
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	items := make([]*Item, 0, len(c.item))
+	for _, it := range c.item {
+		items = append(items, it)
+	}
+	c.mu.Unlock()
 
 	stats := CacheStats{
-		TotalFiles:       len(c.item),
+		TotalFiles:       len(items),
 		TotalCachedBytes: 0,
 	}
-
 	if stats.TotalFiles == 0 {
 		return stats
 	}
 
 	var totalPercentage int
-
-	for _, item := range c.item {
+	for _, item := range items {
 		status, percentage, diskSize := item.GetStatusAndSize()
-
 		switch status {
 		case "FULL":
 			stats.FullCount++
@@ -943,15 +945,9 @@ func (c *Cache) GetAggregateStats() CacheStats {
 		case "UPLOADING":
 			stats.UploadingCount++
 		}
-
 		stats.TotalCachedBytes += diskSize
 		totalPercentage += percentage
 	}
-
-	// Calculate average percentage
-	if stats.TotalFiles > 0 {
-		stats.AverageCachePercentage = totalPercentage / stats.TotalFiles
-	}
-
+	stats.AverageCachePercentage = totalPercentage / stats.TotalFiles
 	return stats
 }

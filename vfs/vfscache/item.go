@@ -1179,7 +1179,16 @@ func (item *Item) HasRange(r ranges.Range) bool {
 	defer item.mu.Unlock()
 	return item.info.Rs.Present(r)
 }
+// GetStatusAndSize returns the cache status, percentage, and disk size in a single call
+// to reduce lock contention when called from GetAggregateStats
+func (item *Item) GetStatusAndSize() (status string, percentage int, diskSize int64) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
 
+	status, percentage = item.VFSStatusCacheWithPercentage()
+	diskSize = item.getDiskSize()
+	return
+}
 // FindMissing adjusts r returning a new ranges.Range which only
 // contains the range which needs to be downloaded. This could be
 // empty - check with IsEmpty. It also adjust this to make sure it is
@@ -1513,4 +1522,15 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	}
 	item.c.writeback.Rename(id, newName)
 	return err
+}
+
+// GetStatusAndSize returns the cache status, percentage, and disk size in a single call
+// to reduce lock contention when called from GetAggregateStats
+func (item *Item) GetStatusAndSize() (status string, percentage int, diskSize int64) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+
+	status, percentage = item.VFSStatusCacheWithPercentage()
+	diskSize = item.getDiskSize()
+	return
 }

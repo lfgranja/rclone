@@ -1189,11 +1189,69 @@ func (item *Item) HasRange(r ranges.Range) bool {
 // to reduce lock contention when called from GetAggregateStats
 func (item *Item) GetStatusAndSize() (status string, percentage int, diskSize int64) {
 	item.mu.Lock()
-	defer item.mu.Unlock()
 
-	status, percentage = item.VFSStatusCacheWithPercentage()
-	diskSize = item.getDiskSize()
-	return
+	// Get disk size while lock is held
+	diskSize = item.info.Rs.Size()
+
+	// The following logic is inlined from VFSStatusCacheWithPercentage to avoid deadlocks
+
+	// Check if item is being uploaded
+	if item.writeBackID != 0 && item.c.writeback != nil {
+		// Check upload status with item lock released to avoid lock ordering issues
+		writeBackID := item.writeBackID
+		wb := item.c.writeback
+		item.mu.Unlock()
+		isUploading := wb.IsUploading(writeBackID)
+		item.mu.Lock()
+		// Re-check that the writeBackID hasn't changed while we released the lock
+		if isUploading && item.writeBackID == writeBackID {
+			item.mu.Unlock()
+			return "UPLOADING", 100, diskSize
+		}
+	}
+
+	// Check if item is dirty (modified but not uploaded yet)
+	if item.info.Dirty {
+		item.mu.Unlock()
+		return "DIRTY", 100, diskSize
+	}
+
+	// Check cache status
+	if item._present() {
+		item.mu.Unlock()
+		return "FULL", 100, diskSize
+	}
+
+	cachedSize := item.info.Rs.Size()
+	totalSize := item.info.Size
+
+	if totalSize <= 0 {
+		item.mu.Unlock()
+		if cachedSize > 0 {
+			// Can't calculate percentage when total size is unknown, so return 99% to indicate
+			// that the file is partially cached but we can't determine the exact percentage.
+			// This prevents confusion with a FULL status (100%).
+			return "PARTIAL", 99, diskSize
+		}
+		return "NONE", 0, diskSize
+	}
+
+	if cachedSize >= totalSize {
+		item.mu.Unlock()
+		return "FULL", 100, diskSize
+	}
+
+	if cachedSize > 0 {
+		percentage := int((cachedSize * 100) / totalSize)
+		item.mu.Unlock()
+		if percentage > 99 {
+			percentage = 99
+		}
+		return "PARTIAL", percentage, diskSize
+	}
+
+	item.mu.Unlock()
+	return "NONE", 0, diskSize
 }
 // FindMissing adjusts r returning a new ranges.Range which only
 // contains the range which needs to be downloaded. This could be

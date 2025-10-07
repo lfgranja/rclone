@@ -126,6 +126,13 @@ func TestRCFileStatus(t *testing.T) {
 	percentage, ok = result["percentage"].(int)
 	require.True(t, ok)
 	assert.Equal(t, 0, percentage)
+
+	// Test with missing path parameter
+	_, err = fileStatusCall.Fn(context.Background(), rc.Params{
+		"fs": r.Fremote.String(),
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no path parameter(s) provided")
 }
 
 func TestRCDirStatus(t *testing.T) {
@@ -147,74 +154,54 @@ func TestRCDirStatus(t *testing.T) {
 	// Add VFS to active cache
 	addToActiveCache(vfs)
 
-	// Give VFS time to process files
-	time.Sleep(100 * time.Millisecond)
-
 	// Test vfs/dir-status endpoint
 	dirStatusCall := rc.Calls.Get("vfs/dir-status")
 	require.NotNil(t, dirStatusCall)
 
 	// Test with valid directory path (root)
-	result, err := dirStatusCall.Fn(context.Background(), rc.Params{
-		"fs":  r.Fremote.String(),
-		"dir": "",
-	})
-	require.NoError(t, err)
+	waitForCondition(t, 5*time.Second, func() bool {
+		result, err := dirStatusCall.Fn(context.Background(), rc.Params{
+			"fs":  r.Fremote.String(),
+			"dir": "testdir",
+		})
+		if err != nil {
+			t.Logf("Error calling vfs/dir-status: %v", err)
+			return false
+		}
 
-	files, ok := result["files"].([]rc.Params)
-	require.True(t, ok)
+		files, ok := result["files"].([]rc.Params)
+		if !ok {
+			t.Logf("Invalid response from vfs/dir-status: %v", result)
+			return false
+		}
 
-	// Since VFS might not see files immediately, let's check for our specific files
-	foundTest1 := false
-	foundTest2 := false
-	for _, file := range files {
-		if name, ok := file["name"].(string); ok {
-			if name == "test1.txt" {
-				foundTest1 = true
-			}
-			if name == "test2.txt" {
-				foundTest2 = true
+		var foundTest1, foundTest2 bool
+		for _, file := range files {
+			if name, ok := file["name"].(string); ok {
+				if name == "test1.txt" {
+					foundTest1 = true
+				}
+				if name == "test2.txt" {
+					foundTest2 = true
+				}
 			}
 		}
-	}
-
-	// If we didn't find our files, that's okay for now - just log it
-	if !foundTest1 || !foundTest2 {
-		t.Log("Test files not found in directory listing - this may be expected due to VFS caching behavior")
-	}
+		return foundTest1 && foundTest2
+	})
 
 	// Test with missing dir parameter (should default to root)
-	result, err = dirStatusCall.Fn(context.Background(), rc.Params{
+	result, err := dirStatusCall.Fn(context.Background(), rc.Params{
 		"fs": r.Fremote.String(),
 	})
 
 	require.NoError(t, err)
 
-	files, ok = result["files"].([]rc.Params)
+	files, ok := result["files"].([]rc.Params)
 	require.True(t, ok)
 	// Check that we found some files (exact count may vary)
 	t.Logf("Found %d files in root directory", len(files))
 	for _, file := range files {
 		t.Logf("File: %s, Status: %s", file["name"], file["status"])
-	}
-
-	// Reset variables for reuse
-	foundTest1 = false
-	foundTest2 = false
-	for _, file := range files {
-		if name, ok := file["name"].(string); ok {
-			if name == "test1.txt" {
-				foundTest1 = true
-			}
-			if name == "test2.txt" {
-				foundTest2 = true
-			}
-		}
-	}
-
-	// If we didn't find our files, that's okay for now - just log it
-	if !foundTest1 || !foundTest2 {
-		t.Log("Test files not found in directory listing - this may be expected due to VFS caching behavior")
 	}
 
 	// Test with non-existent directory
@@ -224,6 +211,18 @@ func TestRCDirStatus(t *testing.T) {
 	})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
+}
+
+// waitForCondition waits for a condition to be true, polling every 100ms until the timeout
+func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if check() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
 }
 
 // Helper function to add VFS to active cache for testing

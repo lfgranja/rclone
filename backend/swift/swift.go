@@ -1149,7 +1149,7 @@ func (f *Fs) newSegmentedUpload(ctx context.Context, dstContainer string, dstPat
 	}
 	if f.opt.UseSegmentsContainer.Value {
 		if f.opt.StoragePolicy == "" {
-			_, err = f.fetchStoragePolicy(ctx, dstContainer)
+err = f.fetchStoragePolicy(ctx, dstContainer)
 			if err != nil {
 				return nil, err
 			}

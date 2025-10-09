@@ -573,7 +573,7 @@ func (f *Fs) fetchStoragePolicy(ctx context.Context, container string) error {
 
 		return shouldRetryHeaders(ctx, rxHeaders, err)
 	})
-	return nil, err
+return err
 }
 
 // NewFsWithConnection constructs an Fs from the path, container:path

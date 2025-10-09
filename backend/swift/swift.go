@@ -563,7 +563,7 @@ func (f *Fs) setRoot(root string) {
 
 // Fetch the base container's policy to be used if/when we need to create a
 // segments container to ensure we use the same policy.
-func (f *Fs) fetchStoragePolicy(ctx context.Context, container string) (fs.Fs, error) {
+func (f *Fs) fetchStoragePolicy(ctx context.Context, container string) error {
 	err := f.pacer.Call(func() (bool, error) {
 		var rxHeaders swift.Headers
 		_, rxHeaders, err := f.c.Container(ctx, container)

@@ -875,6 +875,69 @@ func (c *Cache) TotalInUse() (n int) {
 	return n
 }
 
+// GetStatusForDir returns cache status for all files in a specified directory
+// If recursive is true, it includes all subdirectories
+func (c *Cache) GetStatusForDir(dirPath string, recursive bool) map[string][]rc.Params {
+	filesByStatus := map[string][]rc.Params{
+		"FULL":      {},
+		"PARTIAL":   {},
+		"NONE":      {},
+		"DIRTY":     {},
+		"UPLOADING": {},
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Normalize dirPath - ensure it ends with "/" for prefix matching
+	if dirPath != "" && !strings.HasSuffix(dirPath, "/") {
+		dirPath += "/"
+	}
+
+	for name, item := range c.item {
+		// Check if the item is in the target directory
+		if dirPath == "" || strings.HasPrefix(name, dirPath) {
+			// If not recursive, ensure we only include direct children
+			if !recursive {
+				var relativePath string
+				if dirPath == "" {
+					relativePath = name
+				} else {
+					relativePath = name[len(dirPath):]
+				}
+				// Check if there are any more slashes (indicating subdirectories)
+				// We only want direct children, so there should be no more slashes
+				if strings.Contains(relativePath, "/") {
+					continue
+				}
+			}
+
+			// Get the status and percentage for this item
+			status, percentage, totalSize, cachedSize, isDirty := item.VFSStatusCacheDetailed()
+
+			// Determine if the file is uploading
+			isUploading := (status == "UPLOADING")
+
+			// Create file info
+			fileInfo := rc.Params{
+				"name":        filepath.Base(name),
+				"percentage":  percentage,
+				"uploading":   isUploading,
+				"size":        totalSize,
+				"cachedBytes": cachedSize,
+				"dirty":       isDirty,
+			}
+
+			// Add to the appropriate status category
+			if files, exists := filesByStatus[status]; exists {
+				filesByStatus[status] = append(files, fileInfo)
+			}
+		}
+	}
+
+	return filesByStatus
+}
+
 // Dump the cache into a string for debugging purposes
 func (c *Cache) Dump() string {
 	if c == nil {

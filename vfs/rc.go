@@ -1,59 +1,104 @@
+// VFS remote control for the file system
+//
+// This is for integrating with the rclone rc system
+
 package vfs
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/rc"
-	"github.com/rclone/rclone/vfs/vfscache/writeback"
 )
 
-const getVFSHelp = ` 
-This command takes an "fs" parameter. If this parameter is not
-supplied and if there is only one VFS in use then that VFS will be
-used. If there is more than one VFS in use then the "fs" parameter
-must be supplied.`
-
-// GetVFS gets a VFS with config name "fs" from the cache or returns an error.
-//
-// If "fs" is not set and there is one and only one VFS in the active
-// cache then it returns it. This is for backwards compatibility.
-//
-// This deletes the "fs" parameter from in if it is valid
-func getVFS(in rc.Params) (vfs *VFS, err error) {
-	fsString, err := in.GetString("fs")
-	if rc.IsErrParamNotFound(err) {
-		var count int
-		vfs, count = activeCacheEntries()
-		if count == 1 {
-			return vfs, nil
-		} else if count == 0 {
-			return nil, errors.New(`no VFS active and "fs" parameter not supplied`)
-		}
-		return nil, errors.New(`more than one VFS active - need "fs" parameter`)
-	} else if err != nil {
-		return nil, err
-	}
-	activeMu.Lock()
-	defer activeMu.Unlock()
-	fsString = cache.Canonicalize(fsString)
-	activeVFS := active[fsString]
-	if len(activeVFS) == 0 {
-		return nil, fmt.Errorf("no VFS found with name %q", fsString)
-	} else if len(activeVFS) > 1 {
-		return nil, fmt.Errorf("more than one VFS active with name %q", fsString)
-	}
-	delete(in, "fs") // delete the fs parameter
-	return activeVFS[0], nil
-}
-
+// Adds the vfs/* commands
 func init() {
+	rc.Add(rc.Call{
+		Path:  "vfs/status",
+		Fn:    rcStatus,
+		Title: "Get aggregate cache status statistics.",
+		Help: `
+This returns aggregate cache status statistics for the VFS.
+
+This takes the following parameters:
+
+- fs - select the VFS in use (optional)
+
+This returns a JSON object with the following fields:
+
+- totalFiles - total number of files in VFS
+- fullCount - number of files with FULL cache status
+- partialCount - number of files with PARTIAL cache status  
+- noneCount - number of files with NONE cache status
+- dirtyCount - number of files with DIRTY cache status
+- uploadingCount - number of files with UPLOADING cache status
+- totalCachedBytes - total bytes cached across all files
+- averageCachePercentage - average cache percentage across all files
+` + getVFSHelp,
+	})
+
+	rc.Add(rc.Call{
+		Path:  "vfs/file-status",
+		Fn:    rcFileStatus,
+		Title: "Get detailed cache status of one or more files.",
+		Help: `
+This returns detailed cache status of files including name and percentage.
+
+This takes the following parameters:
+
+- fs - select the VFS in use (optional)
+- file - the path to the file to get the status of (can be repeated as file1, file2, etc.)
+
+This returns a JSON object with the following fields:
+
+- files - array of file objects with fields:
+  - name - leaf name of the file
+  - status - one of "FULL", "PARTIAL", "NONE", "DIRTY", "UPLOADING"
+  - percentage - percentage cached (0-100)
+` + getVFSHelp,
+	})
+
+	rc.Add(rc.Call{
+		Path:  "vfs/dir-status",
+		Fn:    rcDirStatus,
+		Title: "Get cache status of files in a directory.",
+		Help: `
+This returns cache status for all files in a specified directory, optionally including subdirectories. This is ideal for file manager integrations that need to display cache status overlays for directory listings.
+
+This takes the following parameters:
+
+- fs - select the VFS in use (optional)
+- dir - the path to the directory to get the status of
+- recursive - if true, include all subdirectories (optional, defaults to false)
+
+This returns a JSON object with the following fields:
+
+- dir - the directory path that was scanned
+- files - object containing arrays of files grouped by their cache status:
+  - FULL - array of completely cached files
+  - PARTIAL - array of partially cached files  
+  - NONE - array of files not cached
+  - DIRTY - array of files modified locally but not uploaded
+  - UPLOADING - array of files currently being uploaded
+- Each file entry includes:
+  - name - the file name
+  - percentage - cache percentage (0-100)
+  - uploading - whether the file is currently being uploaded
+- recursive - whether subdirectories were included in the scan
+- fs - the file system path
+
+Example:
+  rclone rc vfs/dir-status dir=/documents
+  rclone rc vfs/dir-status dir=/documents recursive=true
+` + getVFSHelp,
+	})
+
 	rc.Add(rc.Call{
 		Path:  "vfs/refresh",
 		Fn:    rcRefresh,
@@ -66,109 +111,16 @@ If no paths are passed in then it will refresh the root directory.
 
     rclone rc vfs/refresh
 
-Otherwise pass directories in as dir=path. Any parameter key
+Otherwise pass directories in as dir=path.  Any parameter key
 starting with dir will refresh that directory, e.g.
 
     rclone rc vfs/refresh dir=home/junk dir2=data/misc
 
 If the parameter recursive=true is given the whole directory tree
-will get refreshed. This refresh will use --fast-list if enabled.
+will get refreshed.  This refresh will use --fast-list if enabled.
 ` + getVFSHelp,
 	})
-}
 
-func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	vfs, err := getVFS(in)
-	if err != nil {
-		return nil, err
-	}
-
-	root, err := vfs.Root()
-	if err != nil {
-		return nil, err
-	}
-	getDir := func(path string) (*Dir, error) {
-		path = strings.Trim(path, "/")
-		segments := strings.Split(path, "/")
-		var node Node = root
-		for _, s := range segments {
-			if dir, ok := node.(*Dir); ok {
-				node, err = dir.stat(s)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-		if dir, ok := node.(*Dir); ok {
-			return dir, nil
-		}
-		return nil, EINVAL
-	}
-
-	recursive := false
-	{
-		const k = "recursive"
-
-		if v, ok := in[k]; ok {
-			s, ok := v.(string)
-			if !ok {
-				return out, fmt.Errorf("value must be string %q=%v", k, v)
-			}
-			recursive, err = strconv.ParseBool(s)
-			if err != nil {
-				return out, fmt.Errorf("invalid value %q=%v", k, v)
-			}
-			delete(in, k)
-		}
-	}
-
-	result := map[string]string{}
-	if len(in) == 0 {
-		if recursive {
-			err = root.readDirTree()
-		} else {
-			err = root.readDir()
-		}
-		if err != nil {
-			result[""] = err.Error()
-		} else {
-			result[""] = "OK"
-		}
-	} else {
-		for k, v := range in {
-			path, ok := v.(string)
-			if !ok {
-				return out, fmt.Errorf("value must be string %q=%v", k, v)
-			}
-			if strings.HasPrefix(k, "dir") {
-				dir, err := getDir(path)
-				if err != nil {
-					result[path] = err.Error()
-				} else {
-					if recursive {
-						err = dir.readDirTree()
-					} else {
-						err = dir.readDir()
-					}
-					if err != nil {
-						result[path] = err.Error()
-					} else {
-						result[path] = "OK"
-					}
-				}
-			} else {
-				return out, fmt.Errorf("unknown key %q", k)
-			}
-		}
-	}
-	out = rc.Params{
-		"result": result,
-	}
-	return out, nil
-}
-
-// Add remote control for the VFS
-func init() {
 	rc.Add(rc.Call{
 		Path:  "vfs/forget",
 		Fn:    rcForget,
@@ -189,104 +141,7 @@ starting with dir will forget that dir, e.g.
     rclone rc vfs/forget file=hello file2=goodbye dir=home/junk
 ` + getVFSHelp,
 	})
-}
 
-func rcForget(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	vfs, err := getVFS(in)
-	if err != nil {
-		return nil, err
-	}
-
-	root, err := vfs.Root()
-	if err != nil {
-		return nil, err
-	}
-
-	forgotten := []string{}
-	if len(in) == 0 {
-		root.ForgetAll()
-	} else {
-		for k, v := range in {
-			path, ok := v.(string)
-			if !ok {
-				return out, fmt.Errorf("value must be string %q=%v", k, v)
-			}
-			path = strings.Trim(path, "/")
-			if strings.HasPrefix(k, "file") {
-				root.ForgetPath(path, fs.EntryObject)
-			} else if strings.HasPrefix(k, "dir") {
-				root.ForgetPath(path, fs.EntryDirectory)
-			} else {
-				return out, fmt.Errorf("unknown key %q", k)
-			}
-			forgotten = append(forgotten, path)
-		}
-	}
-	out = rc.Params{
-		"forgotten": forgotten,
-	}
-	return out, nil
-}
-
-func getDuration(k string, v any) (time.Duration, error) {
-	s, ok := v.(string)
-	if !ok {
-		return 0, fmt.Errorf("value must be string %q=%v", k, v)
-	}
-	interval, err := fs.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("parse duration: %w", err)
-	}
-	return interval, nil
-}
-
-func getInterval(in rc.Params) (time.Duration, bool, error) {
-	k := "interval"
-	v, ok := in[k]
-	if !ok {
-		return 0, false, nil
-	}
-	interval, err := getDuration(k, v)
-	if err != nil {
-		return 0, true, err
-	}
-	if interval < 0 {
-		return 0, true, errors.New("interval must be >= 0")
-	}
-	delete(in, k)
-	return interval, true, nil
-}
-
-func getTimeout(in rc.Params) (time.Duration, error) {
-	k := "timeout"
-	v, ok := in[k]
-	if !ok {
-		return 10 * time.Second, nil
-	}
-	timeout, err := getDuration(k, v)
-	if err != nil {
-		return 0, err
-	}
-	delete(in, k)
-	return timeout, nil
-}
-
-func getStatus(vfs *VFS, in rc.Params) (out rc.Params, err error) {
-	for k, v := range in {
-		return nil, fmt.Errorf("invalid parameter: %s=%s", k, v)
-	}
-	return rc.Params{
-		"enabled":   vfs.Opt.PollInterval != 0,
-		"supported": vfs.pollChan != nil,
-		"interval": map[string]any{
-			"raw":     vfs.Opt.PollInterval,
-			"seconds": time.Duration(vfs.Opt.PollInterval) / time.Second,
-			"string":  vfs.Opt.PollInterval.String(),
-		},
-	}, nil
-}
-
-func init() {
 	rc.Add(rc.Call{
 		Path:  "vfs/poll-interval",
 		Fn:    rcPollInterval,
@@ -313,53 +168,7 @@ might not get picked up by the polling function, depending on the
 used remote.
 ` + getVFSHelp,
 	})
-}
 
-func rcPollInterval(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	vfs, err := getVFS(in)
-	if err != nil {
-		return nil, err
-	}
-
-	interval, intervalPresent, err := getInterval(in)
-	if err != nil {
-		return nil, err
-	}
-	timeout, err := getTimeout(in)
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range in {
-		return nil, fmt.Errorf("invalid parameter: %s=%s", k, v)
-	}
-	if vfs.pollChan == nil {
-		return nil, errors.New("poll-interval is not supported by this remote")
-	}
-
-	if !intervalPresent {
-		return getStatus(vfs, in)
-	}
-	var timeoutHit bool
-	var timeoutChan <-chan time.Time
-	if timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutChan = timer.C
-	}
-	select {
-	case vfs.pollChan <- interval:
-		vfs.Opt.PollInterval = fs.Duration(interval)
-	case <-timeoutChan:
-		timeoutHit = true
-	}
-	out, err = getStatus(vfs, in)
-	if out != nil {
-		out["timeout"] = timeoutHit
-	}
-	return
-}
-
-func init() {
 	rc.Add(rc.Call{
 		Path:  "vfs/list",
 		Title: "List active VFSes.",
@@ -371,27 +180,7 @@ names that could be passed to the other VFS commands in the "fs"
 parameter.`,
 		Fn: rcList,
 	})
-}
 
-func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	activeMu.Lock()
-	defer activeMu.Unlock()
-	var names = []string{}
-	for name, vfses := range active {
-		if len(vfses) == 1 {
-			names = append(names, name)
-		} else {
-			for i := range vfses {
-				names = append(names, fmt.Sprintf("%s[%d]", name, i))
-			}
-		}
-	}
-	out = rc.Params{}
-	out["vfses"] = names
-	return out, nil
-}
-
-func init() {
 	rc.Add(rc.Call{
 		Path:  "vfs/stats",
 		Title: "Stats for a VFS.",
@@ -429,17 +218,7 @@ This returns stats for the selected VFS.
 ` + getVFSHelp,
 		Fn: rcStats,
 	})
-}
 
-func rcStats(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	vfs, err := getVFS(in)
-	if err != nil {
-		return nil, err
-	}
-	return vfs.Stats(), nil
-}
-
-func init() {
 	rc.Add(rc.Call{
 		Path:  "vfs/queue",
 		Title: "Queue info for a VFS.",
@@ -474,20 +253,7 @@ may be files with negative expiry times for which |uploading| is
 `, "|", "`") + getVFSHelp,
 		Fn: rcQueue,
 	})
-}
 
-func rcQueue(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	vfs, err := getVFS(in)
-	if err != nil {
-		return nil, err
-	}
-	if vfs.cache == nil {
-		return nil, nil
-	}
-	return vfs.cache.Queue(), nil
-}
-
-func init() {
 	rc.Add(rc.Call{
 		Path:  "vfs/queue-set-expiry",
 		Title: "Set the expiry time for an item queued for upload.",
@@ -523,34 +289,386 @@ This returns an empty result on success, or an error.
 	})
 }
 
+func rcDirStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+
+	// dir parameter is optional - defaults to root
+	dirPath, err := in.GetString("dir")
+	if err != nil && !rc.IsErrParamNotFound(err) {
+		return nil, err
+	}
+
+	// Check if directory exists (unless it's root which always exists)
+	if dirPath != "" {
+		_, err = vfs.Stat(dirPath)
+		if err != nil {
+			return nil, fmt.Errorf("directory not found: %q", dirPath)
+		}
+	}
+
+	// Check for recursive parameter
+	recursive, _ := in.GetBool("recursive")
+
+	// Get files status using the new optimized method
+	var filesByStatus map[string][]rc.Params
+	if vfs.cache == nil {
+		// If cache is not enabled, return empty results
+		filesByStatus = map[string][]rc.Params{
+			"FULL":      {},
+			"PARTIAL":   {},
+			"NONE":      {},
+			"DIRTY":     {},
+			"UPLOADING": {},
+		}
+	} else {
+		filesByStatus = vfs.cache.GetStatusForDir(dirPath, recursive)
+	}
+
+	// Prepare the response, only include categories that have files
+	responseFiles := rc.Params{}
+	for status, files := range filesByStatus {
+		if len(files) > 0 {
+			responseFiles[status] = files
+		}
+	}
+
+	return rc.Params{
+		"dir":       dirPath,
+		"files":     responseFiles,
+		"recursive": recursive,
+		"fs":        fs.ConfigString(vfs.Fs()),
+	}, nil
+}
+
+func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+
+	// Support both single file and multiple files
+	var paths []string
+
+	// Check for "file" parameter (single file)
+	if path, err := in.GetString("file"); err == nil {
+		paths = []string{path}
+	} else if !rc.IsErrParamNotFound(err) {
+		return nil, err
+	} else {
+		// Check for multiple file parameters (file1, file2, etc.)
+		for i := 1; ; i++ {
+			key := "file" + strconv.Itoa(i)
+			path, pathErr := in.GetString(key)
+			if pathErr != nil {
+				if rc.IsErrParamNotFound(pathErr) {
+					break // No more file parameters
+				}
+				return nil, pathErr
+			}
+			paths = append(paths, path)
+		}
+
+		// If no files found, return error
+		if len(paths) == 0 {
+			return nil, errors.New("no file parameter(s) provided")
+		}
+	}
+
+	// Collect status for each file
+	var results []rc.Params
+	for _, path := range paths {
+		if vfs.cache == nil {
+			results = append(results, rc.Params{
+				"name":        filepath.Base(path),
+				"status":      "NONE",
+				"percentage":  0,
+				"uploading":   false,
+				"size":        0,
+				"cachedBytes": 0,
+				"dirty":       false,
+			})
+		} else {
+			item := vfs.cache.Item(path)
+			status, percentage, totalSize, cachedSize, isDirty := item.VFSStatusCacheDetailed()
+
+			// If status is UPLOADING, then the file is uploading
+			isUploading := (status == "UPLOADING")
+
+			results = append(results, rc.Params{
+				"name":        filepath.Base(path),
+				"status":      status,
+				"percentage":  percentage,
+				"uploading":   isUploading,
+				"size":        totalSize,
+				"cachedBytes": cachedSize,
+				"dirty":       isDirty,
+			})
+		}
+	}
+
+	// Always return results in 'files' array format for consistency
+	return rc.Params{
+		"files": results,
+	}, nil
+}
+
+func rcStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+
+	if vfs.cache == nil {
+		return rc.Params{
+			"totalFiles":             0,
+			"fullCount":              0,
+			"partialCount":           0,
+			"noneCount":              0,
+			"dirtyCount":             0,
+			"uploadingCount":         0,
+			"totalCachedBytes":       0,
+			"averageCachePercentage": 0,
+		}, nil
+	}
+
+	// Get aggregate statistics from cache
+	stats := vfs.cache.GetAggregateStats()
+
+	return rc.Params{
+		"totalFiles":             stats.TotalFiles,
+		"fullCount":              stats.FullCount,
+		"partialCount":           stats.PartialCount,
+		"noneCount":              stats.NoneCount,
+		"dirtyCount":             stats.DirtyCount,
+		"uploadingCount":         stats.UploadingCount,
+		"totalCachedBytes":       stats.TotalCachedBytes,
+		"averageCachePercentage": stats.AverageCachePercentage,
+	}, nil
+}
+
+func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return out, err
+	}
+	remote := vfs.Fs()
+	features := remote.Features()
+	if features.Refresh == nil {
+		return out, fmt.Errorf("backend %s does not support refresh", remote.Name())
+	}
+	opts := fs.ListRHelper(in)
+
+	// Get the paths to refresh
+	var paths []string
+	for key, value := range in {
+		if strings.HasPrefix(key, "dir") || strings.HasPrefix(key, "file") {
+			valueString, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("value for %q must be a string, got %T", key, value)
+			}
+			paths = append(paths, valueString)
+		}
+	}
+
+	// If no paths passed in then use the root directory only
+	if len(paths) == 0 {
+		paths = []string{""}
+	}
+
+	// Refresh the paths
+	for _, path := range paths {
+		err = features.Refresh(ctx, path, opts)
+		if err != nil {
+			return out, fmt.Errorf("failed to refresh %q: %w", path, err)
+		}
+	}
+
+	out = make(rc.Params)
+	return out, nil
+}
+
+func rcForget(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the paths to forget
+	var filePaths, dirPaths []string
+	for key, value := range in {
+		if strings.HasPrefix(key, "file") {
+			valueString, ok := value.(string)
+			if !ok {
+				continue
+			}
+			filePaths = append(filePaths, valueString)
+		} else if strings.HasPrefix(key, "dir") {
+			valueString, ok := value.(string)
+			if !ok {
+				continue
+			}
+			dirPaths = append(dirPaths, valueString)
+		}
+	}
+
+	// If no paths passed in then forget all files and dirs
+	if len(filePaths) == 0 && len(dirPaths) == 0 {
+		vfs.ForgetAll()
+		fs.Debugf(nil, "All files and directories forgotten")
+		return out, nil
+	}
+
+	// Forget the files
+	for _, path := range filePaths {
+		node, err := vfs.Stat(path)
+		if err != nil {
+			fs.Errorf(nil, "File not found %q: %v", path, err)
+			continue
+		}
+		file, ok := node.(*File)
+		if !ok {
+			fs.Errorf(nil, "Path is not a file %q", path)
+			continue
+		}
+		file.Forget()
+		fs.Debugf(nil, "File forgotten %q", path)
+	}
+
+	// Forget the dirs
+	for _, path := range dirPaths {
+		node, err := vfs.Stat(path)
+		if err != nil {
+			fs.Errorf(nil, "Directory not found %q: %v", path, err)
+			continue
+		}
+		dir, ok := node.(*Dir)
+		if !ok {
+			fs.Errorf(nil, "Path is not a directory %q", path)
+			continue
+		}
+		dir.ForgetAll()
+		fs.Debugf(nil, "Directory forgotten %q", path)
+	}
+
+	return out, nil
+}
+
+func rcPollInterval(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+
+	intervalStr, err := in.GetString("interval")
+	if rc.IsErrParamNotFound(err) {
+		// No interval parameter - just return the current status
+		return getStatus(vfs, in)
+	} else if err != nil {
+		return nil, err
+	}
+
+	timeoutStr, _ := in.GetString("timeout")
+
+	interval, err := fs.ParseDuration(intervalStr)
+	if err != nil {
+		return nil, err
+	}
+
+	var timeout time.Duration
+	if timeoutStr != "" {
+		timeout, err = fs.ParseDuration(timeoutStr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err = vfs.SetPollInterval(interval, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return getStatus(vfs, in)
+}
+
+func getStatus(vfs *VFS, in rc.Params) (out rc.Params, err error) {
+	pollInterval := vfs.Opt.PollInterval
+	isExternal := vfs.IsExternal()
+
+	return rc.Params{
+		"enabled":  !pollInterval.IsZero(),
+		"interval": pollInterval,
+		"external": isExternal,
+	}, nil
+}
+
+func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+
+	var vfses []string
+	for _, vfs := range active {
+		vfses = append(vfses, fs.ConfigString(vfs.Fs()))
+	}
+
+	return rc.Params{
+		"vfses": vfses,
+	}, nil
+}
+
+func rcStats(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+	return vfs.Stats(), nil
+}
+
+func rcQueue(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+	if vfs.cache == nil {
+		return rc.Params{}, nil
+	}
+	return vfs.cache.Queue(), nil
+}
+
 func rcQueueSetExpiry(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	vfs, err := getVFS(in)
 	if err != nil {
 		return nil, err
 	}
 	if vfs.cache == nil {
-		return nil, rc.NewErrParamInvalid(errors.New("can't call this unless using the VFS cache"))
+		return nil, errors.New("VFS cache not enabled")
 	}
 
-	// Read input values
 	id, err := in.GetInt64("id")
 	if err != nil {
 		return nil, err
 	}
+
 	expiry, err := in.GetFloat64("expiry")
 	if err != nil {
 		return nil, err
 	}
+
 	relative, err := in.GetBool("relative")
 	if err != nil && !rc.IsErrParamNotFound(err) {
 		return nil, err
 	}
-
-	// Set expiry
-	var refTime time.Time
-	if !relative {
-		refTime = time.Now()
+	// Default to false if parameter not found
+	if err != nil {
+		relative = false
 	}
-	err = vfs.cache.QueueSetExpiry(writeback.Handle(id), refTime, time.Duration(float64(time.Second)*expiry))
-	return nil, err
+
+	err = vfs.cache.SetExpiry(id, expiry, relative)
+	if err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }

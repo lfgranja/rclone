@@ -578,3 +578,34 @@ func rcQueueSetExpiry(ctx context.Context, in rc.Params) (out rc.Params, err err
 	err = vfs.cache.QueueSetExpiry(writeback.Handle(id), refTime, time.Duration(float64(time.Second)*expiry))
 	return nil, err
 }
+
+func init() {
+	rc.Add(rc.Call{
+		Path:   "vfs/file-status",
+		NoAuth: true,
+		Title:  "Report the cache and transfer state of files on a VFS mount.",
+		Help: `
+This reports, for each path in the "paths" parameter, whether
+the file is held in the local cache and the state of its
+upload to the remote.
+
+It takes an "fs" parameter naming the mount and a "paths"
+parameter holding the file paths to report on, e.g.
+
+    rclone rc vfs/file-status fs=mydrive paths=["/mnt/mydrive/file.txt"]
+
+It returns the report under the key "statuses" where the values
+are the per-path result objects.
+` + getVFSHelp,
+		Fn: rcFileStatus,
+	})
+}
+
+// rcFileStatus reports the local cache and upload state of the
+// files named in the "paths" parameter.
+func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	// TODO: implement the decision order (specs/001-vfs-file-status/spec.md
+	// FR-006). Until then the endpoint answers every request with the
+	// whole-request empty_path rejection of contracts/api.md.
+	return nil, errors.New("empty_path: paths is empty or an entry is not absolute")
+}

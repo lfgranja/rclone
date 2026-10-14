@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -38,14 +39,80 @@ func (o *fileStatusResetBarrierObject) Size() int64 {
 	return o.Object.Size()
 }
 
+type fileStatusObservationCallResult struct {
+	out rc.Params
+	err error
+}
+
+func fileStatusObservationDocument(out rc.Params) (map[string]any, error) {
+	body, err := json.Marshal(out)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+func fileStatusObservationPathResult(out rc.Params, path string) (map[string]any, error) {
+	doc, err := fileStatusObservationDocument(out)
+	if err != nil {
+		return nil, err
+	}
+	statuses, ok := doc["statuses"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("response has no statuses array: %v", doc)
+	}
+	for i, raw := range statuses {
+		status, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("statuses[%d] is not an object: %v", i, raw)
+		}
+		if status["path"] == path {
+			return status, nil
+		}
+	}
+	return nil, fmt.Errorf("response has no result for path %q: %v", path, statuses)
+}
+
+func fileStatusObservationPublicState(t *testing.T, call *rc.Call, fsName, path string) map[string]any {
+	t.Helper()
+	doc := fileStatusStateCall(t, call, fsName, []string{path})
+	return fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+}
+
+func fileStatusObservationPublishedCacheStats(call *rc.Call, fsName string) (map[string]any, error) {
+	out, err := call.Fn(context.Background(), rc.Params{"fs": fsName})
+	if err != nil {
+		return nil, err
+	}
+	doc, err := fileStatusObservationDocument(out)
+	if err != nil {
+		return nil, err
+	}
+	diskCache, ok := doc["diskCache"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("vfs/stats response has no diskCache object: %v", doc)
+	}
+	return diskCache, nil
+}
+
 // TestFileStatusObservationResetDoesNotWait checks that an in-flight reset is
 // reported as underivable while Reset holds the item lock, without waiting for
 // the reset to finish (FR-004/026, SC-010).
 func TestFileStatusObservationResetDoesNotWait(t *testing.T) {
 	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fs.Duration(time.Hour))
-	r, vfs, _ := newFileStatusStateRun(t, opt)
+	r, vfs, call := newFileStatusStateRun(t, opt)
+	vfs.MountPoint = r.Fremote.Root()
 	const name = "reset-in-flight"
 	arrangeFileStatusStateCachedFile(t, r, vfs, name, "reset contents")
+	path := fileStatusStatePath(r, name)
+	fsName := fs.ConfigString(r.Fremote)
+	initial := fileStatusObservationPublicState(t, call, fsName, path)
+	local, _ := requireFileStatusStatePair(t, initial)
+	require.Equal(t, statusFullyHeld, local)
 
 	remoteObject, err := r.Fremote.NewObject(context.Background(), name)
 	require.NoError(t, err)
@@ -64,8 +131,6 @@ func TestFileStatusObservationResetDoesNotWait(t *testing.T) {
 	t.Cleanup(func() {
 		assert.NoError(t, item.Close(nil))
 	})
-	require.Positive(t, item.GetInfo().Rs.Size())
-	require.False(t, item.IsDirty())
 
 	barrierObject.armed = true
 	resetDone := make(chan struct{})
@@ -89,14 +154,18 @@ func TestFileStatusObservationResetDoesNotWait(t *testing.T) {
 		t.Fatal("reset did not reach the locked object-fingerprint barrier")
 	}
 
-	statusDone := make(chan FileStatus, 1)
+	statusDone := make(chan fileStatusObservationCallResult, 1)
 	go func() {
-		statusDone <- fileStatusOf(vfs, name, false, false)
+		out, err := call.Fn(context.Background(), rc.Params{
+			"fs":    fsName,
+			"paths": []string{path},
+		})
+		statusDone <- fileStatusObservationCallResult{out: out, err: err}
 	}()
 
 	timer := time.NewTimer(fileStatusObservationPromptLimit)
 	defer timer.Stop()
-	var statusResult FileStatus
+	var statusResult fileStatusObservationCallResult
 	returnedPromptly := true
 	select {
 	case statusResult = <-statusDone:
@@ -118,31 +187,62 @@ func TestFileStatusObservationResetDoesNotWait(t *testing.T) {
 	}
 	assert.NoError(t, resetErr)
 	assert.True(t, returnedPromptly)
-	assert.Equal(t, FileLocalUnderivable, statusResult.Local)
-	statusParams := statusResult.ToParams()
-	bytes, ok := statusParams["bytes"].(rc.Params)
-	require.True(t, ok, "the status has no byte quantities: %v", statusParams)
-	assert.Equal(t, markerNotDeterminable, bytes["unbroken_run"])
-	assert.Equal(t, markerNotDeterminable, bytes["total_held"])
+	require.NoError(t, statusResult.err)
+	result, err := fileStatusObservationPathResult(statusResult.out, path)
+	require.NoError(t, err)
+	reportedLocal, ok := result["local"].(string)
+	require.True(t, ok, "the result carries no local fact: %v", result)
+	assert.Equal(t, statusUnderivable, reportedLocal)
+	unbrokenRun, totalHeld, _ := fileStatusByteInfo(t, result)
+	requireFileStatusByteMarker(t, unbrokenRun, markerNotDeterminable)
+	requireFileStatusByteMarker(t, totalHeld, markerNotDeterminable)
 }
 
 // TestFileStatusObservationCacheStatsInvariant checks cold and repeated
 // status reads against the published cache stats (FR-005/015, US1/AC4).
 func TestFileStatusObservationCacheStatsInvariant(t *testing.T) {
 	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fs.Duration(time.Hour))
-	r, vfs, _ := newFileStatusStateRun(t, opt)
+	r, vfs, statusCall := newFileStatusStateRun(t, opt)
+	vfs.MountPoint = r.Fremote.Root()
 	const name = "cold-status-stats"
-	arrangeFileStatusStateRemoteFile(t, r, vfs, name, "status contents")
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, name, "status contents")
+	fsName := fs.ConfigString(r.Fremote)
+	statsCall := rc.Calls.Get("vfs/stats")
+	require.NotNil(t, statsCall)
 
 	var violation string
 	err := quick.Check(func(seed uint8) bool {
 		vfs.cache.Remove(name)
-		before := vfs.cache.Stats()
+		before, statsErr := fileStatusObservationPublishedCacheStats(statsCall, fsName)
+		if statsErr != nil {
+			violation = fmt.Sprintf("could not read initial published cache stats: %v", statsErr)
+			return false
+		}
 		reads := 2 + int(seed%5)
 		unchanged := true
 		for read := 0; read < reads; read++ {
-			_ = fileStatusOf(vfs, name, false, false)
-			after := vfs.cache.Stats()
+			out, callErr := statusCall.Fn(context.Background(), rc.Params{
+				"fs":    fsName,
+				"paths": []string{path},
+			})
+			if callErr != nil {
+				violation = fmt.Sprintf("status read %d/%d failed: %v", read+1, reads, callErr)
+				return false
+			}
+			result, resultErr := fileStatusObservationPathResult(out, path)
+			if resultErr != nil {
+				violation = fmt.Sprintf("status read %d/%d returned no per-path result: %v", read+1, reads, resultErr)
+				return false
+			}
+			if _, ok := result["local"].(string); !ok {
+				violation = fmt.Sprintf("status read %d/%d returned no state: %v", read+1, reads, result)
+				return false
+			}
+			after, statsErr := fileStatusObservationPublishedCacheStats(statsCall, fsName)
+			if statsErr != nil {
+				violation = fmt.Sprintf("could not read cache stats after status read %d/%d: %v", read+1, reads, statsErr)
+				return false
+			}
 			if !reflect.DeepEqual(before, after) {
 				unchanged = false
 				if violation == "" {
@@ -169,13 +269,14 @@ func TestFileStatusObservationSnapshotUnderInterleaving(t *testing.T) {
 	defer runtime.GOMAXPROCS(previousProcs)
 
 	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fs.Duration(0))
-	r, vfs, _ := newFileStatusStateRun(t, opt)
+	r, vfs, statusCall := newFileStatusStateRun(t, opt)
+	vfs.MountPoint = r.Fremote.Root()
 	const (
 		name = "coherent-status"
 		size = int64(2048)
 	)
-	r.WriteObject(context.Background(), name, strings.Repeat("x", int(size)), time.Now())
-	listFileStatusStateRoot(t, vfs)
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, name, strings.Repeat("x", int(size)))
+	fsName := fs.ConfigString(r.Fremote)
 	remoteObject, err := r.Fremote.NewObject(context.Background(), name)
 	require.NoError(t, err)
 	item := vfs.cache.Item(name)
@@ -193,18 +294,20 @@ func TestFileStatusObservationSnapshotUnderInterleaving(t *testing.T) {
 	require.Equal(t, 1, written)
 	item.Dirty()
 
-	stateA := fileStatusOf(vfs, name, false, false)
-	require.Equal(t, FileLocalPartlyHeld, stateA.Local)
-	require.Equal(t, FileUploadUploadFailed, stateA.Upload)
+	stateA := fileStatusObservationPublicState(t, statusCall, fsName, path)
+	local, upload := requireFileStatusStatePair(t, stateA)
+	require.Equal(t, statusPartlyHeld, local)
+	require.Equal(t, statusUploadFailed, upload)
 	require.NoError(t, item.Truncate(size-1))
-	stateB := fileStatusOf(vfs, name, false, false)
+	stateB := fileStatusObservationPublicState(t, statusCall, fsName, path)
 	require.NotEqual(t, stateA, stateB)
-	require.Equal(t, FileLocalPartlyHeld, stateB.Local)
-	require.Equal(t, FileUploadUploadFailed, stateB.Upload)
+	local, upload = requireFileStatusStatePair(t, stateB)
+	require.Equal(t, statusPartlyHeld, local)
+	require.Equal(t, statusUploadFailed, upload)
 	written, err = item.WriteAt([]byte("z"), size-1)
 	require.NoError(t, err)
 	require.Equal(t, 1, written)
-	require.Equal(t, stateA, fileStatusOf(vfs, name, false, false))
+	require.Equal(t, stateA, fileStatusObservationPublicState(t, statusCall, fsName, path))
 
 	updates := make(chan fileStatusObservationMutation)
 	writerReady := make(chan struct{})
@@ -266,13 +369,13 @@ func TestFileStatusObservationSnapshotUnderInterleaving(t *testing.T) {
 			}
 			updates <- update
 			<-update.started
-			observed := fileStatusOf(vfs, name, false, false)
+			observed := fileStatusObservationPublicState(t, statusCall, fsName, path)
 			if updateErr := <-update.done; updateErr != nil {
 				violation = fmt.Sprintf("update %d/%d failed: %v", observation+1, observations, updateErr)
 				return false
 			}
 			currentSize = targetSize
-			if observed != stateA && observed != stateB {
+			if !reflect.DeepEqual(observed, stateA) && !reflect.DeepEqual(observed, stateB) {
 				valid = false
 				if violation == "" {
 					violation = fmt.Sprintf("observation %d/%d was not either complete record: got=%+v stateA=%+v stateB=%+v", observation+1, observations, observed, stateA, stateB)

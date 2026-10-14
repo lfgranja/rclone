@@ -15,19 +15,16 @@
 // the endpoint answers for the paths under the remote's
 // root, which is the mount's host interior. The
 // mount-point registry that identifier-less resolution goes
-// through is FR-009/FR-014 work and reports null for a VFS
-// created without one.
+// through (FR-009/FR-014, RegisterMountPointForVFS) reports null
+// for a VFS created without one.
 //
-// The endpoint's state derivation is not implemented yet —
-// the handler answers every request with the whole-request
-// empty_path rejection the scaffold leaves in place — so
-// every test asserting a reported state, a byte quantity or
-// an exit status over a fixture fails, which is the state
-// this file is written to produce. The tests that pin the
-// exit map itself and the byte invariants over generated
-// quantities pass; the tests that run the invariant checker
-// against the quantities the endpoint returns fail until
-// the endpoint returns real quantities.
+// They exercise the implemented state derivation (vfs/file_status.go
+// fileStatusOf, T020) and the exit map of FR-027. The exit map
+// itself and the byte invariants over generated quantities pass;
+// the fixture tests that run the invariant checker against the
+// quantities the endpoint returns expose the Phase 8 gaps
+// (zero-byte, unknown size, range gaps, provenance, metadata) as
+// failures for the implementation waves to close.
 package vfs
 
 import (
@@ -1580,27 +1577,26 @@ func TestFileStatusStateSingleObservationInstant(t *testing.T) {
 }
 
 // TestFileStatusStateUnreachableFixtures pins the contract
-// for the states whose fixtures need implementation hooks
-// and are unreachable pre-implementation: download_failed,
-// underivable, uploading and upload_failed. Each case names
-// the fixture the state derivation (T020) must arrange, and
-// asserts the state, the byte quantities and the exit status
-// FR-027 maps the pair to.
+// for the states whose fixtures need fault-injection hooks:
+// download_failed, underivable, uploading and upload_failed. Each
+// case names the hook its fixture arranges, and asserts the state,
+// the byte quantities and the exit status FR-027 maps the pair to.
 //
-// The endpoint currently rejects every request with the
-// whole-request empty_path rejection the scaffold answers
-// with, so each case fails at the response until T020 lands
-// and arranges the fixture; the marker on each case says
-// which hook it needs.
+// The derivation (vfs/file_status.go fileStatusOf, T020) is
+// implemented; the fault-injection hooks live in
+// file_status_failure_test.go and file_status_observation_test.go.
+// The cases below use the plain local fixtures and document the
+// contract each hook must satisfy, failing where the plain fixture
+// cannot arrange the state on its own.
 func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 	content := "0123456789"
 
 	t.Run("download_failed", func(t *testing.T) {
-		// UNREACHABLE PRE-IMPLEMENTATION (T020): needs a
-		// remote whose read of the file fails after caching
+		// Needs a remote whose read of the file fails after caching
 		// part of it — an error-injecting remote or a fault
-		// hook on the download path. The contract: the local
-		// fact takes the failure value, not partly_held, and
+		// hook on the download path (see
+		// TestFileStatusPartialDownloadFailureClearsAfterSuccessfulRetry).
+		// The contract: the local fact takes the failure value, not partly_held, and
 		// the held quantities still describe the bytes that
 		// did arrive, so a caller can tell a mount that lost
 		// data from one still fetching (FR-028). A failed
@@ -1630,10 +1626,10 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 	})
 
 	t.Run("underivable", func(t *testing.T) {
-		// UNREACHABLE PRE-IMPLEMENTATION (T020): needs the
-		// file's cache record to be mid-rewrite by a
+		// Needs the file's cache record to be mid-rewrite by a
 		// concurrent reset when the read lands — a reset hook
-		// that holds the record open. The contract: the mount
+		// that holds the record open (see
+		// TestFileStatusObservationResetDoesNotWait). The contract: the mount
 		// holds a cache entry it cannot derive the held bytes
 		// from, the one condition that produces underivable
 		// (FR-004), so both held quantities carry the
@@ -1661,9 +1657,9 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 	})
 
 	t.Run("uploading", func(t *testing.T) {
-		// UNREACHABLE PRE-IMPLEMENTATION (T020): needs the
-		// file's upload to be in flight when the read lands —
-		// a slow remote that keeps the writeback upload open.
+		// Needs the file's upload to be in flight when the read
+		// lands — a slow remote that keeps the writeback upload
+		// open (see TestFileStatusUploadInFlight).
 		// The contract: the upload fact is uploading, the
 		// writeback item being transferred, while the local
 		// fact reports the written content held in full. The
@@ -1690,11 +1686,11 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 	})
 
 	t.Run("upload_failed", func(t *testing.T) {
-		// UNREACHABLE PRE-IMPLEMENTATION (T020): needs the
-		// file's upload to fail on this mount instance — a
-		// remote whose writes fail, so the writeback item's
-		// in-memory error field is set. The contract: the
-		// upload fact is upload_failed, a failure reported
+		// Needs the file's upload to fail on this mount instance —
+		// a remote whose writes fail, so the writeback item's
+		// in-memory error field is set (see
+		// TestFileStatusUploadFailureRetriesAndClearsAfterSuccess).
+		// The contract: the upload fact is upload_failed, a failure reported
 		// for the life of the mount that observed it and not
 		// carried across a restart, while the local fact
 		// reports the written content held in full. A failed
@@ -1731,12 +1727,9 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 // in progress, so a file-manager overlay asking about every
 // entry it draws is never held up by one.
 //
-// UNREACHABLE PRE-IMPLEMENTATION (T020): arranging a record
-// mid-rewrite needs the reset hook T020 provides; the case
-// names the file to put into that state and asserts the
-// contract — the read returns promptly and reports
-// underivable. Until then it fails at the response, like
-// every fixture test in this file.
+// The deterministic mid-reset arrangement lives in
+// TestFileStatusObservationResetDoesNotWait; this case pins the
+// non-blocking contract on a plain cached fixture.
 func TestFileStatusStateUnderivableNonBlocking(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
@@ -1895,9 +1888,9 @@ func TestFileStatusStateByteInvariantsProperty(t *testing.T) {
 // fixture can arrange: a file the mount never wrote, a file
 // it holds in full, a file it holds in part, a file it
 // cached by reading and a symlink on a mount started to show
-// links. It is red until the endpoint returns real
-// quantities, which the scaffold's whole-request rejection
-// never does.
+// links. The endpoint returns real quantities (vfs/file_status.go
+// fileStatusOf); failures here expose Phase 8 byte-quantity gaps
+// for the implementation waves to close.
 func TestFileStatusStateByteInvariantsFromEndpoint(t *testing.T) {
 	// A file the mount never wrote, on a mount that keeps a
 	// cache: not_held with a true zero held and the file's

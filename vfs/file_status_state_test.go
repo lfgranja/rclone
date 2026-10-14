@@ -37,6 +37,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/quick"
 	"time"
@@ -44,6 +45,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
@@ -105,6 +107,45 @@ var (
 // the file and no more.
 const fileStatusStatePartlyHeldRun = 5
 
+// fileStatusUnknownSizeFs reports a known content stream with an unknown
+// size for one remote path.
+type fileStatusUnknownSizeFs struct {
+	fs.Fs
+	remote  string
+	content []byte
+}
+
+func (f fileStatusUnknownSizeFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	entries, err := f.Fs.List(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	for i, entry := range entries {
+		if object, ok := entry.(fs.Object); ok && object.Remote() == f.remote {
+			entries[i] = f.mockObject()
+		}
+	}
+	return entries, nil
+}
+
+func (f fileStatusUnknownSizeFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	object, err := f.Fs.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	if remote == f.remote {
+		return f.mockObject(), nil
+	}
+	return object, nil
+}
+
+func (f fileStatusUnknownSizeFs) mockObject() fs.Object {
+	object := mockobject.New(f.remote).WithContent(f.content, mockobject.SeekModeRange)
+	object.SetFs(f.Fs)
+	object.SetUnknownSize(true)
+	return object
+}
+
 // newFileStatusStateRun builds an in-process VFS over a
 // local remote with the given options and returns it with
 // the registered vfs/file-status call, the way rc_test.go
@@ -121,6 +162,25 @@ func newFileStatusStateRun(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *
 	call := rc.Calls.Get("vfs/file-status")
 	require.NotNil(t, call)
 	return r, vfs, call
+}
+
+// newFileStatusStateRunAtRemoteRoot uses the test remote's host root as the
+// VFS mount point so endpoint paths map directly to its listed entries.
+func newFileStatusStateRunAtRemoteRoot(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *VFS, *rc.Call) {
+	r, vfs, call := newFileStatusStateRun(t, opt)
+	vfs.MountPoint = r.Fremote.Root()
+	return r, vfs, call
+}
+
+func newFileStatusStateVFSAtRemoteRoot(t *testing.T, r *fstest.Run, remote fs.Fs, opt *vfscommon.Options) (*VFS, *rc.Call) {
+	vfs := New(context.Background(), remote, opt)
+	vfs.MountPoint = r.Fremote.Root()
+	t.Cleanup(func() {
+		cleanupVFS(t, vfs)
+	})
+	call := rc.Calls.Get("vfs/file-status")
+	require.NotNil(t, call)
+	return vfs, call
 }
 
 // fileStatusStateOpt returns the default VFS options with
@@ -542,6 +602,30 @@ func arrangeFileStatusStatePartlyCachedFile(t *testing.T, r *fstest.Run, vfs *VF
 	return fileStatusStatePath(r, name)
 }
 
+type fileStatusStateCacheRange struct {
+	offset  int64
+	content []byte
+}
+
+// seedFileStatusStateCacheRanges installs specific held bytes in a cache item
+// so range-gap and unknown-size fixtures do not depend on download buffering.
+func seedFileStatusStateCacheRanges(t *testing.T, vfs *VFS, name string, object fs.Object, cachedRanges ...fileStatusStateCacheRange) {
+	t.Helper()
+	item := vfs.cache.Item(name)
+	require.NoError(t, item.Open(object))
+	t.Cleanup(func() {
+		if err := item.Close(nil); err != nil {
+			t.Errorf("closing cache item %q: %v", name, err)
+		}
+	})
+	for _, cachedRange := range cachedRanges {
+		n, skipped, err := item.WriteAtNoOverwrite(cachedRange.content, cachedRange.offset)
+		require.NoError(t, err)
+		require.Equal(t, len(cachedRange.content), n)
+		require.Zero(t, skipped)
+	}
+}
+
 // drainFileStatusStateWriteback makes every item queued for
 // writeback eligible immediately, so the mount's writeback
 // loop uploads it on its next check and the test's cleanup
@@ -853,6 +937,41 @@ func TestFileStatusStateFullyHeldNotApplicable(t *testing.T) {
 	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
 }
 
+// TestFileStatusStateUploadProvenance contrasts a file merely read from the
+// remote with one written through the mount and successfully uploaded.
+func TestFileStatusStateUploadProvenance(t *testing.T) {
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
+	readContent := "read from the remote"
+	readPath := arrangeFileStatusStateCachedFile(t, r, vfs, "read-only.txt", readContent)
+
+	writtenContent := "written through the mount"
+	writeFileStatusStateThrough(t, vfs, "written.txt", writtenContent)
+	vfs.WaitForWriters(waitForWritersDelay)
+	writtenPath := fileStatusStatePath(r, "written.txt")
+
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{readPath, writtenPath})
+	statuses := fileStatusStateStatuses(t, doc)
+	for _, tc := range []struct {
+		path        string
+		contentSize int64
+		wantUpload  string
+	}{
+		{path: readPath, contentSize: int64(len(readContent)), wantUpload: statusNotApplicable},
+		{path: writtenPath, contentSize: int64(len(writtenContent)), wantUpload: statusUploaded},
+	} {
+		result := fileStatusStateResult(t, statuses, tc.path)
+		local, upload := requireFileStatusStatePair(t, result)
+		assert.Equal(t, statusFullyHeld, local, "path=%s", tc.path)
+		assert.Equal(t, tc.wantUpload, upload, "path=%s", tc.path)
+		unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+		requireFileStatusByteNumber(t, unbrokenRun, tc.contentSize)
+		requireFileStatusByteNumber(t, totalHeld, tc.contentSize)
+		requireFileStatusByteNumber(t, totalSize, tc.contentSize)
+		assert.Equal(t, exitSuccess, fileStatusExitCode(local, upload, true), "path=%s", tc.path)
+		assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+	}
+}
+
 // TestFileStatusStatePartlyHeld checks a file the mount
 // holds in part: an unbroken run of bytes from offset zero
 // and no more, so the local fact is partly_held with both
@@ -893,6 +1012,180 @@ func TestFileStatusStatePartlyHeld(t *testing.T) {
 
 	assert.Equal(t, exitNotFullyHeld, fileStatusExitCode(local, upload, true))
 	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStateZeroByteFiles distinguishes an empty file whose cache
+// entry was read from one that remains remote-only. Both have a known size of
+// zero, but the cached file is fully held.
+func TestFileStatusStateZeroByteFiles(t *testing.T) {
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
+	remoteName := "empty-remote.txt"
+	cachedName := "empty-cached.txt"
+	r.WriteObject(context.Background(), remoteName, "", t1)
+	r.WriteObject(context.Background(), cachedName, "", t1)
+	listFileStatusStateRoot(t, vfs)
+
+	h, err := vfs.OpenFile(cachedName, os.O_RDONLY, 0777)
+	require.NoError(t, err)
+	n, err := h.Read([]byte{0})
+	assert.Zero(t, n)
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, h.Close())
+	listFileStatusStateRoot(t, vfs)
+
+	remotePath := fileStatusStatePath(r, remoteName)
+	cachedPath := fileStatusStatePath(r, cachedName)
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{remotePath, cachedPath})
+	statuses := fileStatusStateStatuses(t, doc)
+	for _, tc := range []struct {
+		path      string
+		wantLocal string
+	}{
+		{path: remotePath, wantLocal: statusNotHeld},
+		{path: cachedPath, wantLocal: statusFullyHeld},
+	} {
+		result := fileStatusStateResult(t, statuses, tc.path)
+		local, _ := requireFileStatusStatePair(t, result)
+		assert.Equal(t, tc.wantLocal, local, "path=%s", tc.path)
+
+		unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+		requireFileStatusByteNumber(t, unbrokenRun, 0)
+		requireFileStatusByteNumber(t, totalHeld, 0)
+		requireFileStatusByteNumber(t, totalSize, 0)
+		assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+	}
+}
+
+// TestFileStatusStateUnknownTotalSizeUsesCachedPrefix reports the readable
+// prefix even when the remote does not report a total file size.
+func TestFileStatusStateUnknownTotalSizeUsesCachedPrefix(t *testing.T) {
+	if *fstest.RemoteName != "" {
+		t.Skip("Skipping test on non local remote")
+	}
+	r := fstest.NewRun(t)
+	const remoteName = "unknown-size.txt"
+	content := "0123456789abcdefghijklmnopqrstuvwxyz"
+	remote := fileStatusUnknownSizeFs{Fs: r.Fremote, remote: remoteName, content: []byte(content)}
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	vfs, call := newFileStatusStateVFSAtRemoteRoot(t, r, remote, opt)
+
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, remoteName, content)
+	object, err := remote.NewObject(context.Background(), remoteName)
+	require.NoError(t, err)
+	seedFileStatusStateCacheRanges(t, vfs, remoteName, object, fileStatusStateCacheRange{
+		offset:  0,
+		content: []byte(content[:fileStatusStatePartlyHeldRun]),
+	})
+	doc := fileStatusStateCall(t, call, fs.ConfigString(remote), []string{path})
+	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+
+	local, _ := requireFileStatusStatePair(t, result)
+	assert.Equal(t, statusPartlyHeld, local)
+	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+	requireFileStatusByteNumber(t, unbrokenRun, fileStatusStatePartlyHeldRun)
+	requireFileStatusByteNumber(t, totalHeld, fileStatusStatePartlyHeldRun)
+	requireFileStatusByteMarker(t, totalSize, markerNotDeterminable)
+	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStatePartlyHeldRangeGaps distinguishes the prefix available
+// from the total bytes held when a later cached range follows a gap.
+func TestFileStatusStatePartlyHeldRangeGaps(t *testing.T) {
+	const chunkSize = 8
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.HandleCaching = 0
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
+	content := strings.Repeat("01234567", 8)
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, "range-gaps.txt", content)
+	object, err := r.Fremote.NewObject(context.Background(), "range-gaps.txt")
+	require.NoError(t, err)
+	seedFileStatusStateCacheRanges(t, vfs, "range-gaps.txt", object,
+		fileStatusStateCacheRange{offset: 0, content: []byte(content[:chunkSize])},
+		fileStatusStateCacheRange{offset: 2 * chunkSize, content: []byte(content[2*chunkSize : 3*chunkSize])},
+	)
+
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
+	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+	local, _ := requireFileStatusStatePair(t, result)
+	assert.Equal(t, statusPartlyHeld, local)
+	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+	requireFileStatusByteNumber(t, unbrokenRun, chunkSize)
+	requireFileStatusByteNumber(t, totalHeld, 2*chunkSize)
+	requireFileStatusByteNumber(t, totalSize, int64(len(content)))
+	assert.Greater(t, totalHeld.Number, unbrokenRun.Number)
+	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStateByteInvariantsAcrossRangePatterns checks the endpoint's
+// byte quantities against a generated set of discontiguous cache ranges.
+func TestFileStatusStateByteInvariantsAcrossRangePatterns(t *testing.T) {
+	const (
+		chunkSize  = 8
+		chunkCount = 8
+		fileSize   = chunkSize * chunkCount
+	)
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.HandleCaching = 0
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
+	content := strings.Repeat("x", fileSize)
+	mount := fs.ConfigString(r.Fremote)
+	iteration := 0
+	var mismatch string
+	property := func(mask uint8) bool {
+		mask |= 1 // The partly-held cases have a non-empty prefix; zero/full are covered separately.
+		iteration++
+		name := fmt.Sprintf("range-property-%d.txt", iteration)
+		path := arrangeFileStatusStateRemoteFile(t, r, vfs, name, content)
+		object, err := r.Fremote.NewObject(context.Background(), name)
+		require.NoError(t, err)
+		cachedRanges := make([]fileStatusStateCacheRange, 0, chunkCount)
+		for chunk := range chunkCount {
+			if mask&(uint8(1)<<uint(chunk)) == 0 {
+				continue
+			}
+			start := chunk * chunkSize
+			cachedRanges = append(cachedRanges, fileStatusStateCacheRange{
+				offset:  int64(start),
+				content: []byte(content[start : start+chunkSize]),
+			})
+		}
+		seedFileStatusStateCacheRanges(t, vfs, name, object, cachedRanges...)
+
+		doc := fileStatusStateCall(t, call, mount, []string{path})
+		result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+		local, _ := requireFileStatusStatePair(t, result)
+		unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+
+		var wantUnbrokenRun, wantTotalHeld int64
+		for chunk := 0; chunk < chunkCount; chunk++ {
+			if mask&(uint8(1)<<uint(chunk)) == 0 {
+				continue
+			}
+			wantTotalHeld += chunkSize
+			if wantUnbrokenRun == int64(chunk*chunkSize) {
+				wantUnbrokenRun += chunkSize
+			}
+		}
+		wantLocal := statusPartlyHeld
+		if mask == ^uint8(0) {
+			wantLocal = statusFullyHeld
+		}
+		if local != wantLocal || !unbrokenRun.IsNumber || unbrokenRun.Number != wantUnbrokenRun ||
+			!totalHeld.IsNumber || totalHeld.Number != wantTotalHeld ||
+			!totalSize.IsNumber || totalSize.Number != fileSize {
+			mismatch = fmt.Sprintf("mask=%08b: got local=%s bytes=%+v/%+v/%+v; want local=%s unbroken=%d total-held=%d total-size=%d",
+				mask, local, unbrokenRun, totalHeld, totalSize, wantLocal, wantUnbrokenRun, wantTotalHeld, fileSize)
+			return false
+		}
+		if err := checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize); err != nil {
+			mismatch = fmt.Sprintf("mask=%08b: %v", mask, err)
+			return false
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 16}); err != nil {
+		t.Fatalf("byte invariant property failed: %s: %v", mismatch, err)
+	}
 }
 
 // TestFileStatusStateNotRegularFile checks a path naming a
@@ -970,6 +1263,108 @@ func TestFileStatusStateCacheOffNotRegularFile(t *testing.T) {
 	// The carve-out: 11, not the 12 every content value on
 	// this mount takes.
 	assert.Equal(t, exitNotFullyHeld, fileStatusExitCode(local, upload, false))
+	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStateMetadataEntry reports a synthesized metadata file from
+// its readable in-memory content, even though it has no remote cache item.
+func TestFileStatusStateMetadataEntry(t *testing.T) {
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.MetadataExtension = ".meta"
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
+	const sourceName = "metadata-source.txt"
+	r.WriteObject(context.Background(), sourceName, "source content", t1)
+	listFileStatusStateRoot(t, vfs)
+
+	metadataName := sourceName + opt.MetadataExtension
+	metadataPath := fileStatusStatePath(r, metadataName)
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{metadataPath})
+	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), metadataPath)
+
+	metadataNode, err := vfs.Stat(metadataName)
+	require.NoError(t, err)
+	require.True(t, metadataNode.IsFile())
+	assert.True(t, metadataNode.Mode().IsRegular())
+	metadataSize := metadataNode.Size()
+	require.GreaterOrEqual(t, metadataSize, int64(0))
+
+	local, upload := requireFileStatusStatePair(t, result)
+	assert.Equal(t, statusFullyHeld, local)
+	assert.Equal(t, statusNotApplicable, upload)
+	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+	requireFileStatusByteNumber(t, unbrokenRun, metadataSize)
+	requireFileStatusByteNumber(t, totalHeld, metadataSize)
+	requireFileStatusByteNumber(t, totalSize, metadataSize)
+	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStateLinksDisabled reports a link-suffixed remote entry as an
+// ordinary file when the VFS was not started with link translation enabled.
+func TestFileStatusStateLinksDisabled(t *testing.T) {
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.Links = false
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
+	linkName := "shortcut" + fs.LinkSuffix
+	linkContent := "target/that/is/not-followed"
+	path := arrangeFileStatusStateCachedFile(t, r, vfs, linkName, linkContent)
+
+	node, err := vfs.Stat(linkName)
+	require.NoError(t, err)
+	assert.True(t, node.Mode().IsRegular())
+
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
+	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+	local, _ := requireFileStatusStatePair(t, result)
+	assert.Equal(t, statusFullyHeld, local)
+	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+	requireFileStatusByteNumber(t, unbrokenRun, int64(len(linkContent)))
+	requireFileStatusByteNumber(t, totalHeld, int64(len(linkContent)))
+	requireFileStatusByteNumber(t, totalSize, int64(len(linkContent)))
+	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStateCallerPermissionsDoNotChangeStatus verifies that a VFS
+// entry without read permission bits still receives its ordinary mount-state
+// answer; caller permissions are not part of that answer.
+func TestFileStatusStateCallerPermissionsDoNotChangeStatus(t *testing.T) {
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.FilePerms = 0
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
+	content := "mount-visible metadata"
+	path := arrangeFileStatusStateCachedFile(t, r, vfs, "no-read-bits.txt", content)
+
+	node, err := vfs.Stat("no-read-bits.txt")
+	require.NoError(t, err)
+	assert.Zero(t, node.Mode().Perm()&0444)
+
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
+	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+	local, _ := requireFileStatusStatePair(t, result)
+	assert.Equal(t, statusFullyHeld, local)
+	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+	requireFileStatusByteNumber(t, unbrokenRun, int64(len(content)))
+	requireFileStatusByteNumber(t, totalHeld, int64(len(content)))
+	requireFileStatusByteNumber(t, totalSize, int64(len(content)))
+	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+}
+
+// TestFileStatusStateCachedFileDuringHandleGracePeriod reports a closed file
+// while the VFS still retains its cache handle for the configured grace period.
+func TestFileStatusStateCachedFileDuringHandleGracePeriod(t *testing.T) {
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.HandleCaching = fs.Duration(10 * time.Second)
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
+	content := "cached through a handle that has just closed"
+	path := arrangeFileStatusStateCachedFile(t, r, vfs, "grace-period.txt", content)
+
+	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
+	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+	local, _ := requireFileStatusStatePair(t, result)
+	assert.Equal(t, statusFullyHeld, local)
+	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+	requireFileStatusByteNumber(t, unbrokenRun, int64(len(content)))
+	requireFileStatusByteNumber(t, totalHeld, int64(len(content)))
+	requireFileStatusByteNumber(t, totalSize, int64(len(content)))
 	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
 }
 
@@ -1440,8 +1835,9 @@ func TestFileStatusStateByteInvariantsProperty(t *testing.T) {
 		{statusFullyHeld, quantity(1024), quantity(1024), measurable, true},
 		{statusPartlyHeld, quantity(512), quantity(512), quantity(1024), false},
 		{statusPartlyHeld, quantity(512), quantity(512), determinable, false},
+		{statusPartlyHeld, quantity(512), quantity(768), quantity(1024), false},
 		{statusPartlyHeld, quantity(0), quantity(512), quantity(1024), true},
-		{statusPartlyHeld, quantity(512), quantity(1024), quantity(1024), true},
+		{statusPartlyHeld, quantity(512), quantity(1024), quantity(1024), false},
 		{statusPartlyHeld, quantity(512), quantity(256), quantity(1024), true},
 		{statusPartlyHeld, quantity(512), quantity(1024), quantity(512), true},
 		{statusDownloadFailed, quantity(0), quantity(0), quantity(1024), false},

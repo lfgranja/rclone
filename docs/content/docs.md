@@ -3582,6 +3582,8 @@ it will log a high priority message if the retry was successful.
 - `9` - Operation successful, but no files transferred (Requires
   [`--error-on-no-transfer`](#error-on-no-transfer))
 - `10` - Duration exceeded - limit set by --max-duration reached
+- `11` - Not fully held locally - file is not fully cached locally, and the mount keeps a cache
+- `12` - Upload not complete - upload outstanding, failed, or not tracked
 
 ## Environment variables
 

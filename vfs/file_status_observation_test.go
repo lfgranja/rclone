@@ -21,6 +21,19 @@ import (
 
 const fileStatusObservationPromptLimit = 100 * time.Millisecond
 
+func fileStatusObservationOpt(cacheMode vfscommon.CacheMode, writeBack fs.Duration) *vfscommon.Options {
+	opt := fileStatusStateOpt(cacheMode, writeBack)
+	// Keep the local directory listing current throughout status observations.
+	opt.DirCacheTime = fs.Duration(time.Minute)
+	return opt
+}
+
+func registerFileStatusObservationMount(t *testing.T, vfs *VFS, mountPoint string) {
+	t.Helper()
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+}
+
 type fileStatusResetBarrierObject struct {
 	fs.Object
 	armed   bool
@@ -103,9 +116,9 @@ func fileStatusObservationPublishedCacheStats(call *rc.Call, fsName string) (map
 // reported as underivable while Reset holds the item lock, without waiting for
 // the reset to finish (FR-004/026, SC-010).
 func TestFileStatusObservationResetDoesNotWait(t *testing.T) {
-	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fs.Duration(time.Hour))
+	opt := fileStatusObservationOpt(vfscommon.CacheModeFull, fs.Duration(time.Hour))
 	r, vfs, call := newFileStatusStateRun(t, opt)
-	vfs.MountPoint = r.Fremote.Root()
+	registerFileStatusObservationMount(t, vfs, r.Fremote.Root())
 	const name = "reset-in-flight"
 	arrangeFileStatusStateCachedFile(t, r, vfs, name, "reset contents")
 	path := fileStatusStatePath(r, name)
@@ -201,9 +214,9 @@ func TestFileStatusObservationResetDoesNotWait(t *testing.T) {
 // TestFileStatusObservationCacheStatsInvariant checks cold and repeated
 // status reads against the published cache stats (FR-005/015, US1/AC4).
 func TestFileStatusObservationCacheStatsInvariant(t *testing.T) {
-	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fs.Duration(time.Hour))
+	opt := fileStatusObservationOpt(vfscommon.CacheModeFull, fs.Duration(time.Hour))
 	r, vfs, statusCall := newFileStatusStateRun(t, opt)
-	vfs.MountPoint = r.Fremote.Root()
+	registerFileStatusObservationMount(t, vfs, r.Fremote.Root())
 	const name = "cold-status-stats"
 	path := arrangeFileStatusStateRemoteFile(t, r, vfs, name, "status contents")
 	fsName := fs.ConfigString(r.Fremote)
@@ -268,9 +281,9 @@ func TestFileStatusObservationSnapshotUnderInterleaving(t *testing.T) {
 	previousProcs := runtime.GOMAXPROCS(2)
 	defer runtime.GOMAXPROCS(previousProcs)
 
-	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fs.Duration(0))
+	opt := fileStatusObservationOpt(vfscommon.CacheModeFull, fs.Duration(0))
 	r, vfs, statusCall := newFileStatusStateRun(t, opt)
-	vfs.MountPoint = r.Fremote.Root()
+	registerFileStatusObservationMount(t, vfs, r.Fremote.Root())
 	const (
 		name = "coherent-status"
 		size = int64(2048)

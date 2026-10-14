@@ -30,7 +30,15 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		// "go" is not always on PATH; the toolchain that built this test
 		// binary knows where its own GOROOT is.
-		goBin = filepath.Join(runtime.GOROOT(), "bin", "go")
+		// Use `go env GOROOT` instead of deprecated runtime.GOROOT().
+		cmd := exec.Command("go", "env", "GOROOT")
+		output, err := cmd.Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "go env GOROOT failed: %v\n", err)
+			os.Exit(1)
+		}
+		goRoot := strings.TrimSpace(string(output))
+		goBin = filepath.Join(goRoot, "bin", "go")
 	}
 
 	binDir, err := os.MkdirTemp("", "rclone-vfs-status-test")

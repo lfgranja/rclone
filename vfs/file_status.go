@@ -123,13 +123,11 @@ func fileStatusFromItem(item *vfscache.Item, cachePath string, underivable bool,
 		if size >= 0 {
 			totalKnown = true
 		}
-	} else {
+	} else if size >= 0 {
 		// Underivable: both held quantities are not_determinable
 		// (rendered by ToParams). Total size is still a measurement
 		// where the mount knows it (FR-002, FR-004).
-		if size >= 0 {
-			totalKnown = true
-		}
+		totalKnown = true
 	}
 
 	// Local fact derivation.
@@ -185,7 +183,7 @@ func fileStatusFromItem(item *vfscache.Item, cachePath string, underivable bool,
 	}
 
 	return FileStatus{
-		Local: local,
+		Local:  local,
 		Upload: upload,
 		Bytes: FileByteInfo{
 			UnbrokenRun: unbrokenRun,

@@ -96,8 +96,8 @@ const (
 // flight across a measurement window, and a drain delay
 // for stopping a load driver.
 const (
-	fileStatusTransferSize   = 10 << 20           // the transfer load's payload
-	fileStatusTransferChunk  = 1 << 20            // transfer chunk between paces
+	fileStatusTransferSize   = 10 << 20 // the transfer load's payload
+	fileStatusTransferChunk  = 1 << 20  // transfer chunk between paces
 	fileStatusTransferPace   = 5 * time.Millisecond
 	fileStatusLoadDrainDelay = 5 * time.Second
 )
@@ -108,20 +108,20 @@ const (
 // the WSS/MRC curve's RSS flatness tolerance are the
 // constants those curves are asserted against.
 const (
-	fileStatusDeltaMReps       = 100                   // warm repetitions of the measured query
-	fileStatusDeltaMPopulation = 100                   // mount file count ΔM is measured against
-	fileStatusDeltaMPages      = 4                     // per-query ΔM bound, in pages
-	fileStatusVmHWMCurve       = 64                    // D values the VmHWM curve varies over
-	fileStatusVmHWMSlopePages  = 128                   // k, the per-distinct-file slope, in pages
-	fileStatusCPUStep          = 8                     // response-size step, in result objects
-	fileStatusCPUWarmup        = 20                    // warm-up repetitions before measuring CPU
-	fileStatusCPUReps          = 5000                  // measured repetitions per response size
+	fileStatusDeltaMReps       = 100                    // warm repetitions of the measured query
+	fileStatusDeltaMPopulation = 100                    // mount file count ΔM is measured against
+	fileStatusDeltaMPages      = 4                      // per-query ΔM bound, in pages
+	fileStatusVMHWMCurve       = 64                     // D values the VmHWM curve varies over
+	fileStatusVMHWMSlopePages  = 128                    // k, the per-distinct-file slope, in pages
+	fileStatusCPUStep          = 8                      // response-size step, in result objects
+	fileStatusCPUWarmup        = 20                     // warm-up repetitions before measuring CPU
+	fileStatusCPUReps          = 5000                   // measured repetitions per response size
 	fileStatusCPUSlack         = 100 * time.Microsecond // fixed per-query CPU slack
-	fileStatusClockTicks       = 100                   // sysconf(_SC_CLK_TCK), the /proc/self/stat unit
-	fileStatusWSSUniverse      = 1000                  // paths the warm query set is drawn from
-	fileStatusWSSQuerySet      = 100                   // the fixed, pre-generated warm query set
-	fileStatusWSSQueries       = 100                   // queries per matrix point
-	fileStatusRSSFlatPages     = 128                   // RSS flatness tolerance, in pages
+	fileStatusClockTicks       = 100                    // sysconf(_SC_CLK_TCK), the /proc/self/stat unit
+	fileStatusWSSUniverse      = 1000                   // paths the warm query set is drawn from
+	fileStatusWSSQuerySet      = 100                    // the fixed, pre-generated warm query set
+	fileStatusWSSQueries       = 100                    // queries per matrix point
+	fileStatusRSSFlatPages     = 128                    // RSS flatness tolerance, in pages
 )
 
 // fileStatusNewRun is the rc_test.go harness with caching
@@ -438,11 +438,11 @@ func fileStatusResetLoad(vfs *VFS, name string, stop <-chan struct{}) {
 	}()
 }
 
-// fileStatusVmHWM returns the process's peak resident
+// fileStatusVMHWM returns the process's peak resident
 // set size in pages, read from the VmHWM line of
 // /proc/self/status. VmHWM never decreases on its own,
 // so per-point HWM isolation resets it between points.
-func fileStatusVmHWM() (int64, error) {
+func fileStatusVMHWM() (int64, error) {
 	blob, err := os.ReadFile("/proc/self/status")
 	if err != nil {
 		return 0, fmt.Errorf("reading /proc/self/status: %w", err)
@@ -789,7 +789,7 @@ func TestFileStatusPerfVmHWM(t *testing.T) {
 	// The distinct files the curve varies D over,
 	// written through the mount so the cache holds an
 	// entry for each.
-	distinct := make([]string, fileStatusVmHWMCurve)
+	distinct := make([]string, fileStatusVMHWMCurve)
 	for i := range distinct {
 		name := fmt.Sprintf("vmhwm-%04d.txt", i)
 		distinct[i] = filepath.Join(r.Fremote.Root(), name)
@@ -798,10 +798,10 @@ func TestFileStatusPerfVmHWM(t *testing.T) {
 	// The D = 0 baseline: the peak with no distinct
 	// file queried.
 	fileStatusResetHWM()
-	baseline, err := fileStatusVmHWM()
+	baseline, err := fileStatusVMHWM()
 	require.NoError(t, err)
 	prevDelta := int64(0)
-	for d := 1; d <= fileStatusVmHWMCurve; d++ {
+	for d := 1; d <= fileStatusVMHWMCurve; d++ {
 		// Per-point HWM isolation: each point measures
 		// its own peak.
 		fileStatusResetHWM()
@@ -816,14 +816,14 @@ func TestFileStatusPerfVmHWM(t *testing.T) {
 		}
 		_, err := call.Fn(context.Background(), in)
 		require.NoError(t, err, "querying %d distinct files", d)
-		hwm, err := fileStatusVmHWM()
+		hwm, err := fileStatusVMHWM()
 		require.NoError(t, err)
 		delta := hwm - baseline
 		growth := delta - prevDelta
 		prevDelta = delta
-		assert.LessOrEqual(t, growth, int64(fileStatusVmHWMSlopePages),
+		assert.LessOrEqual(t, growth, int64(fileStatusVMHWMSlopePages),
 			"D=%d: baseline-subtracted ΔVmHWM grew %d pages, more than the %d-page per-distinct-file slope",
-			d, growth, fileStatusVmHWMSlopePages)
+			d, growth, fileStatusVMHWMSlopePages)
 	}
 }
 

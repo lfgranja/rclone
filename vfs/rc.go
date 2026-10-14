@@ -14,8 +14,8 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/rc"
-	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 const getVFSHelp = ` 
@@ -1129,13 +1129,4 @@ func buildStatusResult(path string, status FileStatus, cacheOff bool) map[string
 	result := status.ToParams()
 	result["path"] = path
 	return result
-}
-
-// buildSinglePathResponse builds a response for a single path with an error.
-func buildSinglePathResponse(path, code, message string) rc.Params {
-	return rc.Params{
-		"statuses": []map[string]any{
-			buildErrorResult(path, code, message),
-		},
-	}
 }

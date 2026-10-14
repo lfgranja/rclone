@@ -3,13 +3,17 @@ package vfs
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -186,6 +190,134 @@ func TestFileStatusResolveOutsideAnyMount(t *testing.T) {
 		require.True(t, ok, "the result must carry the per-path error object")
 		assert.Equal(t, "outside_any_mount", perPathError["code"])
 	}
+}
+
+func TestFileStatusResolveParentSymlinkUsesTargetMount(t *testing.T) {
+	r, vfs, call := rcNewRun(t, "vfs/file-status")
+	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
+
+	mountPoint := t.TempDir()
+	linkParent := filepath.Join(t.TempDir(), "mount-alias")
+	if err := os.Symlink(mountPoint, linkParent); err != nil {
+		t.Skipf("cannot create directory symlink: %v", err)
+	}
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+
+	result := fileStatusResolvePath(t, call, filepath.Join(linkParent, "file.txt"))
+	assert.NotContains(t, result, "error", "parent links are resolved to the mount serving their target")
+}
+
+func TestFileStatusResolveDanglingParentSymlinkIsOutsideAnyMount(t *testing.T) {
+	_, vfs, call := rcNewRun(t, "vfs/file-status")
+	mountPoint := t.TempDir()
+	linkPath := filepath.Join(mountPoint, "dangling")
+	danglingTarget := filepath.Join(t.TempDir(), "target-does-not-exist")
+	if err := os.Symlink(danglingTarget, linkPath); err != nil {
+		t.Skipf("cannot create directory symlink: %v", err)
+	}
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+
+	result := fileStatusResolvePath(t, call, filepath.Join(linkPath, "file.txt"))
+	perPathError, ok := result["error"].(map[string]any)
+	require.True(t, ok, "a dangling parent link names no reachable mount path")
+	assert.Equal(t, "outside_any_mount", perPathError["code"])
+}
+
+func TestFileStatusResolveFinalSymlinkIsNotFollowed(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.Links = true
+	r, vfs, call := newFileStatusStateRun(t, &opt)
+
+	r.WriteObject(context.Background(), "target.txt", "target contents", time.Now())
+	r.WriteObject(context.Background(), "link.rclonelink", "target.txt", time.Now())
+	mountPoint := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(mountPoint, "target.txt"), []byte("host target"), 0600))
+	if err := os.Symlink("target.txt", filepath.Join(mountPoint, "link")); err != nil {
+		t.Skipf("cannot create file symlink: %v", err)
+	}
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+
+	result := fileStatusResolvePath(t, call, filepath.Join(mountPoint, "link"))
+	assert.Equal(t, "not_regular_file", result["local"], "the final component is the VFS symlink itself")
+}
+
+func TestFileStatusResolveOverlappingMountsAreAmbiguous(t *testing.T) {
+	r, vfs1, call := rcNewRun(t, "vfs/file-status")
+	opt2 := vfs1.Opt
+	opt2.NoModTime = !opt2.NoModTime
+	vfs2 := New(context.Background(), r.Fremote, &opt2)
+	t.Cleanup(func() { cleanupVFS(t, vfs2) })
+
+	mountPoint1 := t.TempDir()
+	mountPoint2 := filepath.Join(mountPoint1, "nested")
+	require.NoError(t, os.Mkdir(mountPoint2, 0700))
+	RegisterMountPointForVFS(vfs1, mountPoint1)
+	RegisterMountPointForVFS(vfs2, mountPoint2)
+	t.Cleanup(func() {
+		UnregisterMountPointForVFS(vfs2)
+		UnregisterMountPointForVFS(vfs1)
+	})
+
+	result := fileStatusResolvePath(t, call, filepath.Join(mountPoint2, "file.txt"))
+	perPathError, ok := result["error"].(map[string]any)
+	require.True(t, ok, "overlapping registrations do not select either mount")
+	assert.Equal(t, "ambiguous_mount", perPathError["code"])
+}
+
+func TestFileStatusResolveComponentBoundary(t *testing.T) {
+	_, vfs, call := rcNewRun(t, "vfs/file-status")
+	parent := t.TempDir()
+	mountPoint := filepath.Join(parent, "mount")
+	sibling := filepath.Join(parent, "mount-extra")
+	require.NoError(t, os.Mkdir(mountPoint, 0700))
+	require.NoError(t, os.Mkdir(sibling, 0700))
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+
+	result := fileStatusResolvePath(t, call, filepath.Join(sibling, "file.txt"))
+	perPathError, ok := result["error"].(map[string]any)
+	require.True(t, ok, "a sibling component sharing the mount-point prefix is outside")
+	assert.Equal(t, "outside_any_mount", perPathError["code"])
+}
+
+func TestFileStatusResolveWindowsCaseInsensitive(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path matching is platform-specific")
+	}
+	r, vfs, call := rcNewRun(t, "vfs/file-status")
+	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
+	mountPoint := t.TempDir()
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+
+	requestPath := filepath.Join(togglePathCase(mountPoint), "file.txt")
+	result := fileStatusResolvePath(t, call, requestPath)
+	assert.NotContains(t, result, "error", "Windows mount matching is case-insensitive")
+}
+
+func togglePathCase(path string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r - 'a' + 'A'
+		case r >= 'A' && r <= 'Z':
+			return r - 'A' + 'a'
+		default:
+			return r
+		}
+	}, path)
+}
+
+func fileStatusResolvePath(t *testing.T, call *rc.Call, path string) map[string]any {
+	t.Helper()
+	out, err := call.Fn(context.Background(), rc.Params{"paths": []string{path}})
+	require.NoError(t, err)
+	statuses := decodeStatuses(t, out)
+	require.Len(t, statuses, 1)
+	return statuses[0]
 }
 
 // mountPointsObject adapts the "mountPoints" value of the report

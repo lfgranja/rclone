@@ -430,7 +430,7 @@ func TestFileStatusUploadFailureRetriesAndClearsAfterSuccess(t *testing.T) {
 	assert.Equal(t, 2, second.number)
 	assert.Contains(t, second.remote, name)
 	retrying := fileStatusFailureResult(t, r, fixture, path)
-	assert.Equal(t, "uploading", retrying["upload"])
+	assert.Equal(t, "upload_failed", retrying["upload"])
 	unblockRetry()
 
 	uploaded := waitForFileStatusUploadState(t, r, fixture, path, "uploaded")

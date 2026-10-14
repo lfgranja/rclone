@@ -808,18 +808,11 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 		singlePath := filepath.Clean(paths[0])
 		vfsInstance, vfsName = resolveVFSForPath(singlePath)
 		if vfsInstance == nil {
-			// Path didn't resolve to a VFS. Check if there are any
-			// active VFSes with mount points. If yes, this is a
-			// per-path outside_any_mount result (the call reached
-			// the mount level but the path is outside all mount
-			// points). If no VFSes are active at all, it's a
-			// whole-request rejection.
-			_, activeCount := activeCacheEntries()
-			if activeCount == 0 {
-				return nil, rc.NewFileStatusError("no_active_mount", "no VFS active", 400)
-			}
-			// VFSes exist but path is outside all mount points.
-			// Return per-path result in the statuses array.
+			// Path didn't resolve to a VFS. This is a per-path
+			// outside_any_mount result (the call reached the mount
+			// level but the path is outside all registered mount
+			// points). Per FR-006 decision order level 3, this is
+			// a per-path result, not a whole-request rejection.
 			result := buildErrorResult(singlePath, "outside_any_mount", "path lies outside any registered mount point")
 			out = rc.Params{"statuses": []any{result}}
 			return out, nil

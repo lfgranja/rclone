@@ -2,7 +2,9 @@ package vfs
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"testing"
 	"testing/quick"
@@ -243,12 +245,19 @@ func TestFileStatusRegistryNullMountPointDoesNotBecomeHostPath(t *testing.T) {
 }
 
 func TestFileStatusRegistryCompletenessProperty(t *testing.T) {
-	_, vfs, listCall := rcNewRun(t, "vfs/list")
+	r, vfs, listCall := rcNewRun(t, "vfs/list")
+	statusCall := rc.Calls.Get("vfs/file-status")
+	require.NotNil(t, statusCall)
+	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
 	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
 	root := t.TempDir()
 
 	complete := func(input string) bool {
-		mountPoint := filepath.Join(root, "mount-"+hex.EncodeToString([]byte(input)))
+		digest := sha256.Sum256([]byte(input))
+		mountPoint := filepath.Join(root, "mount-"+hex.EncodeToString(digest[:]))
+		if err := os.MkdirAll(mountPoint, 0700); err != nil {
+			return false
+		}
 		RegisterMountPointForVFS(vfs, mountPoint)
 
 		names, points := fileStatusRegistrySnapshot(t, listCall)
@@ -271,8 +280,22 @@ func TestFileStatusRegistryCompletenessProperty(t *testing.T) {
 		if identifier == "" {
 			return false
 		}
-		resolvedVFS, resolvedName := resolveVFSForPath(filepath.Join(mountPoint, "probe"))
-		return resolvedVFS == vfs && resolvedName == identifier
+
+		path := filepath.Join(mountPoint, "file.txt")
+		out, err := statusCall.Fn(context.Background(), rc.Params{"paths": []string{path}})
+		if err != nil {
+			return false
+		}
+		statuses := decodeStatuses(t, out)
+		if len(statuses) != 1 {
+			return false
+		}
+		result := statuses[0]
+		if result["path"] != path {
+			return false
+		}
+		_, hasPathError := result["error"]
+		return !hasPathError
 	}
 
 	if err := quick.Check(complete, &quick.Config{MaxCount: 40}); err != nil {

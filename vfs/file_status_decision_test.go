@@ -5,16 +5,16 @@
 // harness, the way rc_test.go drives its siblings: the call is
 // fetched from rc.Calls and its Fn invoked directly.
 //
-// The endpoint's handler is not implemented yet, so every
-// request is answered with the whole-request empty_path
-// rejection the stub answers with. The tests asserting that
-// rejection pass; every test asserting another outcome of the
-// decision order fails, which is the state this file is
-// written to produce. The per-path outcomes of decision-order
-// level 3 and the overlapping-mount-point refusal are not
-// constructible at all until the mount-point registry the
-// handler resolves against lands with it (FR-009/FR-014,
-// T022), and are pinned as skips for that implementation.
+// They exercise the implemented handler (vfs/rc.go rcFileStatus)
+// and the mount-point registry it resolves against (FR-009/FR-014,
+// RegisterMountPointForVFS). Request-shape and identifier levels are
+// asserted directly; the per-path outcomes of decision-order level 3
+// that need no mount interior are asserted here, while the ones that
+// need a registered mount interior are covered in the sibling suites
+// (not_found and unaccountable_path in file_status_remote_test.go,
+// directory and non-regular files in file_status_state_test.go,
+// overlap and parent links in file_status_resolve_test.go). The
+// placeholders below remain as skips documenting that split.
 package vfs
 
 import (
@@ -41,10 +41,9 @@ import (
 // answers with (contracts/api.md "Whole-Request Error
 // Response").
 //
-// The handler stub still answers with a plain error whose
-// message opens with the code, in the "code: message" shape
-// FileStatusError.Error reports, so until the handler returns
-// the typed error the code is read from that prefix instead.
+// The handler returns the typed error; the "code: message" prefix
+// fallback below is retained only for robustness against a plain
+// error carrying the same shape FileStatusError.Error reports.
 func requireRejection(t *testing.T, err error, code string) {
 	t.Helper()
 	require.Error(t, err)
@@ -59,9 +58,9 @@ func requireRejection(t *testing.T, err error, code string) {
 }
 
 // fileStatusRejectionCode returns the code of a whole-request
-// rejection, reading it from a typed *rc.FileStatusError where
-// the endpoint answers one and from the "code: message" prefix
-// of the plain error the handler stub answers otherwise.
+// rejection, reading it from the typed *rc.FileStatusError the
+// endpoint answers, with a "code: message" prefix fallback for a
+// plain error carrying the same shape.
 func fileStatusRejectionCode(err error) string {
 	var fse *rc.FileStatusError
 	if errors.As(err, &fse) {
@@ -362,34 +361,32 @@ func TestFileStatusDecisionAmbiguousMount(t *testing.T) {
 		// A path lying inside more than one registered mount point
 		// is refused as ambiguous_mount, never resolved to either
 		// mount, with no longest-prefix or first-registered
-		// tiebreak (FR-009). Constructing it needs two mounts with
-		// overlapping registered mount points, which the
-		// mount-point registry the handler resolves against
-		// provides (FR-009/FR-014, T022).
-		t.Skip("requires two mounts with overlapping registered mount points (FR-009, FR-014, T022)")
+		// tiebreak (FR-009). The overlapping-registration case is
+		// covered in file_status_resolve_test.go
+		// TestFileStatusResolveOverlappingMountsAreAmbiguous; this
+		// placeholder documents the decision-order level it belongs to.
+		t.Skip("overlapping-registration case covered in TestFileStatusResolveOverlappingMountsAreAmbiguous")
 	})
 }
 
-// TestFileStatusDecisionPerPathClassification covers the
+// TestFileStatusDecisionPerPathClassification names the
 // per-path outcomes of decision-order level 3 (FR-006,
 // FR-032): not_found, directory_not_file, the non-regular-file
 // local fact with not_measurable byte quantities, and
 // unaccountable_path.
 //
-// Each is reached only through a mount created with a mount
-// point (FR-009/FR-014): the in-process harness creates VFSes
-// without one, and no existing symbol registers a mount point,
-// so these outcomes are not constructible until the
-// mount-point registry the handler resolves against lands with
-// it (T022). Each skip is pinned here for that implementation
-// to replace with the real test.
+// Each needs a mount with a registered mount point (FR-009/FR-014)
+// and is covered in the sibling suite that arranges that interior:
+// not_found and unaccountable_path in file_status_remote_test.go,
+// directory_not_file and not_regular_file in file_status_state_test.go.
+// The skips below document that split rather than future work.
 func TestFileStatusDecisionPerPathClassification(t *testing.T) {
 	t.Run("not_found", func(t *testing.T) {
-		t.Skip("requires a mount with a registered mount point holding entries (FR-009, FR-014, T022)")
+		t.Skip("covered in TestFileStatusDoesNotQueryRemote (FR-009, FR-014)")
 	})
 
 	t.Run("directory_not_file", func(t *testing.T) {
-		t.Skip("requires a mount with a registered mount point holding a directory (FR-009, FR-014, T022)")
+		t.Skip("covered in TestFileStatusStateDirectory (FR-009, FR-014)")
 	})
 
 	t.Run("not_regular_file with not_measurable bytes", func(t *testing.T) {
@@ -397,11 +394,11 @@ func TestFileStatusDecisionPerPathClassification(t *testing.T) {
 		// reports the non-regular-file value of the local fact
 		// with not_measurable for all three byte quantities
 		// (FR-032, contracts/api.md "Byte Info Fields").
-		t.Skip("requires a mount started to show links with a registered mount point (FR-009, FR-014, FR-032, T022)")
+		t.Skip("covered in TestFileStatusStateNotRegularFile (FR-009, FR-014, FR-032)")
 	})
 
 	t.Run("unaccountable_path", func(t *testing.T) {
-		t.Skip("requires a mount with a registered mount point holding no listing of the parent (FR-009, FR-014, T022)")
+		t.Skip("covered in TestFileStatusDoesNotQueryRemote unaccountable case (FR-009, FR-014)")
 	})
 }
 

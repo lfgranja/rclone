@@ -793,6 +793,11 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 			return nil, rc.NewFileStatusError("ambiguous_mount", "multiple paths provided but no fs parameter", 400)
 		}
 		// Single path - resolve against mount points
+		// But first check if there are any active mounts at all
+		_, activeCount := activeCacheEntries()
+		if activeCount == 0 {
+			return nil, rc.NewFileStatusError("no_active_mount", "no VFS active", 400)
+		}
 		singlePath := filepath.Clean(paths[0])
 		vfsInstance, vfsName = resolveVFSForPath(singlePath)
 		if vfsInstance == nil {
@@ -944,9 +949,26 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 				cachePath := relPath
 				if o, err := vfsInstance.f.NewObject(vfsInstance.ctx, cachePath); err == nil && o != nil {
 					// File exists on remote but not in cache - treat as regular file with no cache entry
-					isLink := false
+					// Construct status directly to avoid cache lookup which might return a stale item
 					cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
-					status := fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
+					size := o.Size()
+					var upload FileUploadState
+					if cacheOff {
+						upload = FileUploadNotTracked
+					} else {
+						upload = FileUploadNotApplicable
+					}
+					status := FileStatus{
+						Local:  FileLocalNotHeld,
+						Upload: upload,
+						Bytes: FileByteInfo{
+							UnbrokenRun: 0,
+							TotalHeld:   0,
+							TotalSize:   size,
+							TotalKnown:  true,
+						},
+						IsDir: false,
+					}
 					return buildStatusResult(path, status, cacheOff)
 				}
 				// File doesn't exist on remote either

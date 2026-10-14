@@ -464,6 +464,73 @@ func (item *Item) IsDirty() bool {
 	return item.info.Dirty
 }
 
+// GetInfo returns a snapshot of the item's persisted info for
+// status reporting. It takes the item's lock to ensure a
+// consistent observation instant (FR-022).
+func (item *Item) GetInfo() Info {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.info
+}
+
+// GetWriteBackID returns the writeback handle for the item.
+func (item *Item) GetWriteBackID() writeback.Handle {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.writeBackID
+}
+
+// GetDownloadersError returns the downloader error state for
+// detecting download failures (FR-028). Returns errorCount and
+// lastErr, or 0 and nil if no downloaders.
+func (item *Item) GetDownloadersError() (errorCount int, lastErr error) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if item.downloaders == nil {
+		return 0, nil
+	}
+	return item.downloaders.GetError()
+}
+
+// IsBeingReset returns true if the cache cleaner is currently
+// resetting this item's cache file. Used to report underivable
+// without blocking (FR-026).
+func (item *Item) IsBeingReset() bool {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.beingReset
+}
+
+// GetFingerprint returns the remote object fingerprint, or empty
+// string if not set. Used to determine if upload completed.
+func (item *Item) GetFingerprint() string {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.info.Fingerprint
+}
+
+// GetRanges returns the byte ranges currently held in the cache.
+func (item *Item) GetRanges() ranges.Ranges {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	// Return a copy to avoid races
+	if item.info.Rs == nil {
+		return nil
+	}
+	rs := make(ranges.Ranges, len(item.info.Rs))
+	copy(rs, item.info.Rs)
+	return rs
+}
+
+// GetSizeLocked returns the item's recorded size without
+// re-statting the file. Used for status reporting where we want
+// the persisted size.
+func (item *Item) GetSizeLocked() int64 {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.info.Size
+}
+
 // Create the cache file and store the metadata on disk
 // Called with item.mu locked
 func (item *Item) _createFile(osPath string) (err error) {

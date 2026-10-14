@@ -64,6 +64,12 @@ func newFileStatusCountingFs(inner fs.Fs) *fileStatusCountingFs {
 	return counted
 }
 
+func registerFileStatusTestMount(t *testing.T, testVFS *VFS, mountPoint string) {
+	t.Helper()
+	RegisterMountPointForVFS(testVFS, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(testVFS) })
+}
+
 func (f *fileStatusCountingFs) Features() *fs.Features {
 	return f.features
 }
@@ -110,7 +116,7 @@ func newFileStatusCountingVFS(t *testing.T) (*fstest.Run, *VFS, *fileStatusCount
 	t.Cleanup(func() { cleanupVFS(t, testVFS) })
 
 	mountPoint := filepath.Join(t.TempDir(), "mount")
-	testVFS.MountPoint = mountPoint
+	registerFileStatusTestMount(t, testVFS, mountPoint)
 	return run, testVFS, counted, mountPoint
 }
 
@@ -369,7 +375,7 @@ func TestFileStatusMalformedFsValuesHTTPContract(t *testing.T) {
 func TestFileStatusJSONEnvelopeProperty(t *testing.T) {
 	run, testVFS, _ := rcNewRun(t, "vfs/file-status")
 	base := t.TempDir()
-	testVFS.MountPoint = filepath.Join(base, "mount")
+	registerFileStatusTestMount(t, testVFS, filepath.Join(base, "mount"))
 	fsName := fs.ConfigString(run.Fremote)
 	testURL := startFileStatusHTTPServer(t)
 
@@ -410,7 +416,7 @@ func TestFileStatusJSONEnvelopeProperty(t *testing.T) {
 func TestFileStatusUnknownParameterProperty(t *testing.T) {
 	run, testVFS, call := rcNewRun(t, "vfs/file-status")
 	base := t.TempDir()
-	testVFS.MountPoint = filepath.Join(base, "mount")
+	registerFileStatusTestMount(t, testVFS, filepath.Join(base, "mount"))
 	fsName := fs.ConfigString(run.Fremote)
 	path := filepath.Join(base, "outside", "probe.txt")
 	request := func() rc.Params {

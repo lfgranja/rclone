@@ -787,22 +787,42 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 		}
 		vfsInstance = activeVFS[0]
 		vfsName = fsString
+
+		// A VFS without an explicit mount point uses its remote's root
+		// as the implicit mount point (for in-process/RC/serve VFSes
+		// created without a mount point). This allows the endpoint to
+		// serve path-based queries against the remote's root.
+		if vfsInstance.MountPoint == "" {
+			root, err := vfsInstance.Root()
+			if err != nil {
+				return nil, rc.NewFileStatusError("unaccountable_path", fmt.Sprintf("cannot access VFS root: %v", err), 400)
+			}
+			vfsInstance.MountPoint = root.Path()
+		}
 	} else {
 		// No identifier provided
 		if len(paths) > 1 {
 			return nil, rc.NewFileStatusError("ambiguous_mount", "multiple paths provided but no fs parameter", 400)
 		}
-		// Single path - resolve against mount points
-		// But first check if there are any active mounts at all
-		_, activeCount := activeCacheEntries()
-		if activeCount == 0 {
-			return nil, rc.NewFileStatusError("no_active_mount", "no VFS active", 400)
-		}
+		// Single path - resolve against mount points.
 		singlePath := filepath.Clean(paths[0])
 		vfsInstance, vfsName = resolveVFSForPath(singlePath)
 		if vfsInstance == nil {
-			// Path is outside any mount point
-			return buildSinglePathResponse(singlePath, "outside_any_mount", "path lies outside any registered mount point"), nil
+			// Path didn't resolve to a VFS. Check if there are any
+			// active VFSes with mount points. If yes, this is a
+			// per-path outside_any_mount result (the call reached
+			// the mount level but the path is outside all mount
+			// points). If no VFSes are active at all, it's a
+			// whole-request rejection.
+			_, activeCount := activeCacheEntries()
+			if activeCount == 0 {
+				return nil, rc.NewFileStatusError("no_active_mount", "no VFS active", 400)
+			}
+			// VFSes exist but path is outside all mount points.
+			// Return per-path result in the statuses array.
+			result := buildErrorResult(singlePath, "outside_any_mount", "path lies outside any registered mount point")
+			out = rc.Params{"statuses": []any{result}}
+			return out, nil
 		}
 	}
 

@@ -105,19 +105,30 @@ func fileStatusCallOutcome(call *rc.Call, in rc.Params) string {
 	return "statuses:" + string(b)
 }
 
-// withEmptyActiveMap empties the VFS active cache for the
-// duration of fn, restoring it afterwards, so a request can be
-// observed reaching a server with no mount active at all.
+// withEmptyActiveMap empties the VFS active cache AND the
+// mountPoints registry for the duration of fn, restoring both
+// afterwards, so a request can be observed reaching a server
+// with no mount active at all and no registered mount points.
 func withEmptyActiveMap(t *testing.T, fn func()) {
 	t.Helper()
 	activeMu.Lock()
-	saved := active
+	savedActive := active
 	active = map[string][]*VFS{}
 	activeMu.Unlock()
+
+	mountPointsMu.Lock()
+	savedMountPoints := mountPoints
+	mountPoints = map[string]string{}
+	mountPointsMu.Unlock()
+
 	defer func() {
 		activeMu.Lock()
-		active = saved
+		active = savedActive
 		activeMu.Unlock()
+
+		mountPointsMu.Lock()
+		mountPoints = savedMountPoints
+		mountPointsMu.Unlock()
 	}()
 	fn()
 }

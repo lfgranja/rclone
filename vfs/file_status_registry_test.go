@@ -249,6 +249,18 @@ func TestFileStatusRegistryCompletenessProperty(t *testing.T) {
 	statusCall := rc.Calls.Get("vfs/file-status")
 	require.NotNil(t, statusCall)
 	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
+	rootDir, err := vfs.Root()
+	require.NoError(t, err)
+	entries, err := rootDir.ReadDirAll()
+	require.NoError(t, err)
+	listedFile := false
+	for _, entry := range entries {
+		if entry.Name() == "file.txt" {
+			listedFile = true
+			break
+		}
+	}
+	require.True(t, listedFile, "the test file must be present in the VFS listing")
 	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
 	root := t.TempDir()
 

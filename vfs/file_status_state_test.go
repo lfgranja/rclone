@@ -310,12 +310,19 @@ func fileStatusExitCode(local, upload string, mountKeepsCache bool) int {
 // value, which asserts nothing about held content, keeps
 // the not-fully-held-locally status; otherwise a content
 // value on a mount that keeps no cache takes the
-// upload-not-complete status; and every other pair takes
-// the not-fully-held-locally status, the local fact taking
-// precedence.
+// upload-not-complete status; otherwise a fully held file
+// whose upload is not settled takes the upload-not-complete
+// status; and every other pair takes the not-fully-held-
+// locally status, the local fact taking precedence.
 func wantFileStatusStateExit(local, upload string, mountKeepsCache bool) int {
-	if local == statusFullyHeld && (upload == statusUploaded || upload == statusNotApplicable) {
-		return exitSuccess
+	if local == statusFullyHeld {
+		if upload == statusUploaded || upload == statusNotApplicable {
+			return exitSuccess
+		}
+		// fully_held with any outstanding upload state
+		// (awaiting_upload, uploading, upload_failed) takes
+		// upload-not-complete (FR-027, SC-021).
+		return exitUploadNotComplete
 	}
 	if local == statusNotRegularFile {
 		return exitNotFullyHeld

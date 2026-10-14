@@ -494,6 +494,46 @@ func TestExitCodeForStateCacheModeProperty(t *testing.T) {
 	}
 }
 
+// TestExitCodeForStateExhaustiveContract checks the full local×upload matrix
+// (T078): exit 0 only for fully_held with uploaded/not_applicable, 11 for
+// non-regular files (even cache-off), and 12 for every other cache-off
+// content state, per commands/cli.md "Exit Status Codes" and FR-027/SC-021.
+func TestExitCodeForStateExhaustiveContract(t *testing.T) {
+	localStates := []string{
+		"fully_held",
+		"partly_held",
+		"not_held",
+		"underivable",
+		"download_failed",
+		"not_regular_file",
+	}
+	uploadStates := []string{
+		"uploaded",
+		"awaiting_upload",
+		"uploading",
+		"upload_failed",
+		"not_applicable",
+		"not_tracked",
+	}
+	for _, local := range localStates {
+		for _, upload := range uploadStates {
+			got := exitCodeForState(local, upload)
+			want := expectedExitCodeForContract(local, upload)
+			if got != want {
+				t.Errorf("exitCodeForState(%q, %q) = %d, want %d", local, upload, got, want)
+			}
+			if want == 0 && !(local == "fully_held" && (upload == "uploaded" || upload == "not_applicable")) {
+				t.Errorf("exit 0 for (%q, %q): success must be only fully_held with uploaded/not_applicable", local, upload)
+			}
+			switch got {
+			case 0, 11, 12:
+			default:
+				t.Errorf("exitCodeForState(%q, %q) = %d, want one of 0, 11, 12", local, upload, got)
+			}
+		}
+	}
+}
+
 func TestNoOutputFlagIsRemoved(t *testing.T) {
 	path := "/mnt/test/file.txt"
 	server, requests := startStatusHTTPServer(t, func(w http.ResponseWriter, _ *http.Request, request capturedStatusRequest) {
@@ -587,6 +627,7 @@ func TestOtherRCFailuresStillProduceJSON(t *testing.T) {
 		body        string
 	}{
 		{name: "authentication rejection", statusCode: http.StatusUnauthorized, contentType: "text/plain", body: "Unauthorized"},
+		{name: "forbidden", statusCode: http.StatusForbidden, contentType: "text/plain", body: "Forbidden"},
 		{name: "server error", statusCode: http.StatusInternalServerError, contentType: "text/plain", body: "internal error"},
 		{name: "invalid JSON response", statusCode: http.StatusOK, contentType: "application/json", body: "not-json"},
 		{name: "missing statuses", statusCode: http.StatusOK, contentType: "application/json", body: `{}`},
@@ -674,6 +715,29 @@ func TestFSSelectionIsSentToRC(t *testing.T) {
 	request := receiveStatusRequest(t, requests)
 	if request.FS != "drive[1]" {
 		t.Errorf("RC fs = %q, want drive[1]", request.FS)
+	}
+	if len(request.Paths) != 1 || request.Paths[0] != path {
+		t.Errorf("RC paths = %v, want [%q]", request.Paths, path)
+	}
+}
+
+// TestFSOmittedSendsEmptyFS checks the negative half of --fs selection
+// (T081): without --fs the RC body carries no mount identifier and the
+// endpoint answer is still echoed byte-for-byte with exit 0.
+func TestFSOmittedSendsEmptyFS(t *testing.T) {
+	path := "/mnt/shared/file.txt"
+	server, requests := startStatusHTTPServer(t, func(w http.ResponseWriter, _ *http.Request, request capturedStatusRequest) {
+		writeStatusEnvelope(w, statusResult(request.Paths[0], "fully_held", "uploaded"))
+	})
+
+	code, stdout, _ := runVFSStatusAt(t, server.URL, path)
+	if code != 0 {
+		t.Errorf("vfs status without --fs: exit code = %d, want 0", code)
+	}
+	assertJSONOutputEquals(t, stdout, statusResult(path, "fully_held", "uploaded"))
+	request := receiveStatusRequest(t, requests)
+	if request.FS != "" {
+		t.Errorf("RC fs = %q, want empty when --fs is omitted", request.FS)
 	}
 	if len(request.Paths) != 1 || request.Paths[0] != path {
 		t.Errorf("RC paths = %v, want [%q]", request.Paths, path)

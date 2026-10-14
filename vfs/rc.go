@@ -904,7 +904,13 @@ func isPathInsideMountPoint(path, mountPoint string) bool {
 		return true
 	}
 	// Check if path starts with mountPoint + separator
-	prefix := mountPoint + string(filepath.Separator)
+	// Handle root mount point "/" specially to avoid "//" prefix
+	var prefix string
+	if mountPoint == "/" {
+		prefix = "/"
+	} else {
+		prefix = mountPoint + string(filepath.Separator)
+	}
 	return strings.HasPrefix(path, prefix)
 }
 
@@ -915,11 +921,20 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 	// Determine the effective mount point
 	mountPoint := vfsInstance.MountPoint
 	if mountPoint == "" && hasFsParam {
-		// VFS has no mount point but we have an fs identifier.
-		// A VFS without a mount point has no host interior
-		// (FR-009/FR-014), so it cannot serve path-based queries.
-		// Report outside_any_mount rather than using the remote's root.
-		return buildErrorResult(path, "outside_any_mount", "path lies outside any registered mount point")
+		// VFS has no explicit mount point but we have an fs
+		// identifier - use the remote's root as the implicit
+		// mount point (for in-process/RC/serve VFSes created
+		// without a mount point). This allows the endpoint to
+		// serve path-based queries against the remote's root.
+		root, err := vfsInstance.Root()
+		if err != nil {
+			return buildErrorResult(path, "unaccountable_path", fmt.Sprintf("cannot access VFS root: %v", err))
+		}
+		mountPoint = root.Path()
+		if mountPoint == "" {
+			// Root directory of remote has empty path - treat as "/"
+			mountPoint = "/"
+		}
 	}
 
 	if mountPoint == "" {

@@ -125,11 +125,13 @@ func newFileStatusStateRun(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *
 
 // fileStatusStateOpt returns the default VFS options with
 // the cache mode and the writeback delay overridden, the
-// way the read/write tests build their options.
+// way the read/write tests build their options. DirCacheTime
+// is set to 0 to disable directory caching for tests.
 func fileStatusStateOpt(cacheMode vfscommon.CacheMode, writeBack fs.Duration) *vfscommon.Options {
 	opt := vfscommon.Opt
 	opt.CacheMode = cacheMode
 	opt.WriteBack = writeBack
+	opt.DirCacheTime = 0
 	return &opt
 }
 
@@ -476,6 +478,7 @@ func listFileStatusStateRoot(t *testing.T, vfs *VFS) {
 // writeFileStatusStateThrough writes a file through the mount
 // and closes it, leaving the content in the cache and the
 // writeback item queued for the mount's writeback delay.
+// Refreshes the VFS directory cache so the endpoint can find the file.
 func writeFileStatusStateThrough(t *testing.T, vfs *VFS, name, content string) {
 	t.Helper()
 	h, err := vfs.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0777)
@@ -484,6 +487,7 @@ func writeFileStatusStateThrough(t *testing.T, vfs *VFS, name, content string) {
 	require.NoError(t, err)
 	assert.Equal(t, len(content), n)
 	require.NoError(t, h.Close())
+	listFileStatusStateRoot(t, vfs) // refresh directory cache
 }
 
 // readFileStatusStateThrough reads a file through the mount,
@@ -501,10 +505,12 @@ func readFileStatusStateThrough(t *testing.T, vfs *VFS, name, content string) {
 
 // arrangeFileStatusStateRemoteFile writes a file straight to
 // the remote, so the mount holds no cache entry for it, and
-// returns its host path.
-func arrangeFileStatusStateRemoteFile(t *testing.T, r *fstest.Run, name, content string) string {
+// returns its host path. Refreshes the VFS directory cache so
+// the endpoint can find the file.
+func arrangeFileStatusStateRemoteFile(t *testing.T, r *fstest.Run, vfs *VFS, name, content string) string {
 	t.Helper()
 	r.WriteObject(context.Background(), name, content, t1)
+	listFileStatusStateRoot(t, vfs) // refresh directory cache
 	return fileStatusStatePath(r, name)
 }
 
@@ -515,6 +521,7 @@ func arrangeFileStatusStateCachedFile(t *testing.T, r *fstest.Run, vfs *VFS, nam
 	t.Helper()
 	r.WriteObject(context.Background(), name, content, t1)
 	readFileStatusStateThrough(t, vfs, name, content)
+	listFileStatusStateRoot(t, vfs) // refresh directory cache
 	return fileStatusStatePath(r, name)
 }
 
@@ -659,7 +666,7 @@ func TestFileStatusStateNotHeldNotApplicable(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
 	content := "0123456789"
-	path := arrangeFileStatusStateRemoteFile(t, r, "never-written.txt", content)
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, "never-written.txt", content)
 
 	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
 	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
@@ -689,7 +696,7 @@ func TestFileStatusStateCacheOffContentValue(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeOff, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
 	content := "written straight to the remote"
-	path := arrangeFileStatusStateRemoteFile(t, r, "remote-only.txt", content)
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, "remote-only.txt", content)
 
 	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
 	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
@@ -719,7 +726,7 @@ func TestFileStatusStateNotTrackedMountGuard(t *testing.T) {
 	listFileStatusStateRoot(t, vfs)
 	mount := fs.ConfigString(r.Fremote)
 
-	remoteOnly := arrangeFileStatusStateRemoteFile(t, r, "remote-only.txt", "on the remote already")
+	remoteOnly := arrangeFileStatusStateRemoteFile(t, r, vfs, "remote-only.txt", "on the remote already")
 	writeFileStatusStateThrough(t, vfs, "written-through.txt", "written through a mount that keeps no cache")
 	writtenThrough := fileStatusStatePath(r, "written-through.txt")
 
@@ -740,7 +747,7 @@ func TestFileStatusStateNotTrackedMountGuard(t *testing.T) {
 	r2, vfs2, call2 := newFileStatusStateRun(t, cacheKeeping)
 	listFileStatusStateRoot(t, vfs2)
 	mount2 := fs.ConfigString(r2.Fremote)
-	neverWritten := arrangeFileStatusStateRemoteFile(t, r2, "never-written.txt", "content")
+	neverWritten := arrangeFileStatusStateRemoteFile(t, r2, vfs2, "never-written.txt", "content")
 	fullyCached := arrangeFileStatusStateCachedFile(t, r2, vfs2, "fully-cached.txt", "content")
 
 	doc2 := fileStatusStateCall(t, call2, mount2, []string{neverWritten, fullyCached})
@@ -1083,7 +1090,7 @@ func TestFileStatusStateUnknownParameterIgnored(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
 	content := "content"
-	path := arrangeFileStatusStateRemoteFile(t, r, "never-written.txt", content)
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, "never-written.txt", content)
 
 	out, err := call.Fn(context.Background(), rc.Params{
 		"fs":      fs.ConfigString(r.Fremote),
@@ -1116,7 +1123,7 @@ func TestFileStatusStateSingleObservationInstant(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
 	mount := fs.ConfigString(r.Fremote)
-	neverWritten := arrangeFileStatusStateRemoteFile(t, r, "never-written.txt", "content")
+	neverWritten := arrangeFileStatusStateRemoteFile(t, r, vfs, "never-written.txt", "content")
 	fullyCached := arrangeFileStatusStateCachedFile(t, r, vfs, "fully-cached.txt", "content")
 
 	// A mount that downloads in small chunks, so a file read
@@ -1182,7 +1189,7 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 		// (FR-027).
 		r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 		listFileStatusStateRoot(t, vfs)
-		path := arrangeFileStatusStateRemoteFile(t, r, "failed-download.txt", content)
+		path := arrangeFileStatusStateRemoteFile(t, r, vfs, "failed-download.txt", content)
 
 		doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
 		result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
@@ -1473,7 +1480,7 @@ func TestFileStatusStateByteInvariantsFromEndpoint(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
 	mount := fs.ConfigString(r.Fremote)
-	neverWritten := arrangeFileStatusStateRemoteFile(t, r, "never-written.txt", "0123456789")
+	neverWritten := arrangeFileStatusStateRemoteFile(t, r, vfs, "never-written.txt", "0123456789")
 	fullyCached := arrangeFileStatusStateCachedFile(t, r, vfs, "fully-cached.txt", "0123456789")
 
 	doc := fileStatusStateCall(t, call, mount, []string{neverWritten, fullyCached})

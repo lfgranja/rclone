@@ -22,9 +22,10 @@ import (
 
 // The tests in this file pin the request shape (T010) and the
 // whole-request delivery (T011) of the vfs/file-status endpoint of
-// contracts/api.md. They assert the contract of FR-006, so they fail
-// against the scaffolded handler until the decision order and the
-// typed-error delivery are implemented.
+// contracts/api.md. They assert the contract of FR-006 against the
+// implemented handler (vfs/rc.go rcFileStatus) and the typed-error
+// delivery (fs/rc FileStatusError rendered by the rc server's
+// writeFileStatusError).
 
 // fileStatusChildEnv marks the re-executed child process of
 // TestFileStatusNoActiveMount.

@@ -915,8 +915,11 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 	// Determine the effective mount point
 	mountPoint := vfsInstance.MountPoint
 	if mountPoint == "" && hasFsParam {
-		// VFS has no mount point but we have an fs identifier - use the remote's root
-		mountPoint = vfsInstance.f.Root()
+		// VFS has no mount point but we have an fs identifier.
+		// A VFS without a mount point has no host interior
+		// (FR-009/FR-014), so it cannot serve path-based queries.
+		// Report outside_any_mount rather than using the remote's root.
+		return buildErrorResult(path, "outside_any_mount", "path lies outside any registered mount point")
 	}
 
 	if mountPoint == "" {

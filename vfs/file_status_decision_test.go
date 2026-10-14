@@ -71,6 +71,41 @@ func fileStatusRejectionCode(err error) string {
 	return code
 }
 
+// requirePerPathError asserts that the endpoint returned a
+// successful response (no error) with a statuses array
+// containing exactly one result for the given path, and that
+// result carries the given error code in its "error" object.
+// This is for per-path errors at decision order level 3 (e.g.
+// outside_any_mount, not_found, unaccountable_path, etc.)
+// which are returned in the statuses array with HTTP 200.
+func requirePerPathError(t *testing.T, out rc.Params, path, code string) {
+	t.Helper()
+	require.NoError(t, nil, "endpoint should return successful response for per-path error")
+	// rc.Params is map[string]any; statuses may be []map[string]any
+	// which is not directly assignable to []any. Use type switch.
+	statusesVal, ok := out["statuses"]
+	require.True(t, ok, "response missing statuses array: %v", out)
+	var raw []any
+	switch v := statusesVal.(type) {
+	case []any:
+		raw = v
+	case []map[string]any:
+		raw = make([]any, len(v))
+		for i, m := range v {
+			raw[i] = m
+		}
+	default:
+		require.Fail(t, "statuses is not a slice: %T", statusesVal)
+	}
+	require.Len(t, raw, 1, "expected exactly one status result")
+	status, ok := raw[0].(map[string]any)
+	require.True(t, ok, "status is not an object: %v", raw[0])
+	assert.Equal(t, path, status["path"], "path mismatch")
+	errObj, ok := status["error"].(map[string]any)
+	require.True(t, ok, "status missing error object: %v", status)
+	assert.Equal(t, code, errObj["code"], "error code mismatch")
+}
+
 // copyFileStatusParams returns a copy of a file-status request,
 // so concurrent calls never share the parameter map, which the
 // endpoint may consume parameters from, as the sibling handlers'
@@ -261,15 +296,17 @@ func TestFileStatusDecisionOutsideAnyMount(t *testing.T) {
 
 	t.Run("single path inside no registered mount point", func(t *testing.T) {
 		in := rc.Params{"paths": []string{filepath.Join(t.TempDir(), "no-such-file.txt")}}
-		_, err := call.Fn(context.Background(), in)
-		requireRejection(t, err, "outside_any_mount")
+		out, err := call.Fn(context.Background(), in)
+		require.NoError(t, err)
+		requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
 	})
 
 	t.Run("single path with no mount active", func(t *testing.T) {
 		withEmptyActiveMap(t, func() {
 			in := rc.Params{"paths": []string{"/no/such/mount/point/file.txt"}}
-			_, err := call.Fn(context.Background(), in)
-			requireRejection(t, err, "outside_any_mount")
+			out, err := call.Fn(context.Background(), in)
+			require.NoError(t, err)
+			requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
 		})
 	})
 
@@ -278,8 +315,9 @@ func TestFileStatusDecisionOutsideAnyMount(t *testing.T) {
 		dangling := filepath.Join(dir, "dangling-link")
 		require.NoError(t, os.Symlink(filepath.Join(dir, "no-such-target"), dangling))
 		in := rc.Params{"paths": []string{filepath.Join(dangling, "file.txt")}}
-		_, err := call.Fn(context.Background(), in)
-		requireRejection(t, err, "outside_any_mount")
+		out, err := call.Fn(context.Background(), in)
+		require.NoError(t, err)
+		requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
 	})
 
 	t.Run("path outside a mount without a mount point", func(t *testing.T) {
@@ -292,8 +330,9 @@ func TestFileStatusDecisionOutsideAnyMount(t *testing.T) {
 			"fs":    fs.ConfigString(r.Fremote),
 			"paths": []string{"/no/such/mount/point/file.txt"},
 		}
-		_, err := call.Fn(context.Background(), in)
-		requireRejection(t, err, "outside_any_mount")
+		out, err := call.Fn(context.Background(), in)
+		require.NoError(t, err)
+		requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
 	})
 }
 

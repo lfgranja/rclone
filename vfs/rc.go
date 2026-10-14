@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 )
 
@@ -19,6 +23,94 @@ This command takes an "fs" parameter. If this parameter is not
 supplied and if there is only one VFS in use then that VFS will be
 used. If there is more than one VFS in use then the "fs" parameter
 must be supplied.`
+
+// mountPointsMu protects the mountPoints map.
+var mountPointsMu sync.Mutex
+
+// mountPoints maps the indexed VFS name (as returned by vfs/list)
+// to its mount point path. A VFS created without a mount point
+// (in-process, remote-control, or serve usage) is not registered
+// here, so it will not appear in the map.
+var mountPoints = map[string]string{}
+
+// RegisterMountPoint registers a mount point for a VFS. The name
+// must be one of the names returned by activeCacheEntries (the
+// indexed form, e.g. "mydrive" or "mydrive[1]").
+func RegisterMountPoint(name, mountPoint string) {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	mountPoints[name] = mountPoint
+}
+
+// UnregisterMountPoint removes a mount point registration for a VFS.
+func UnregisterMountPoint(name string) {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	delete(mountPoints, name)
+}
+
+// GetMountPoint returns the mount point for a VFS by its indexed name,
+// or empty string if the VFS has no registered mount point.
+func GetMountPoint(name string) string {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	return mountPoints[name]
+}
+
+// GetAllMountPoints returns a copy of the mountPoints map.
+func GetAllMountPoints() map[string]string {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	result := make(map[string]string, len(mountPoints))
+	for k, v := range mountPoints {
+		result[k] = v
+	}
+	return result
+}
+
+// RegisterMountPointForVFS finds the VFS in the active cache and
+// registers its mount point using the correct indexed name.
+func RegisterMountPointForVFS(vfs *VFS, mountPoint string) {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	configName := fs.ConfigString(vfs.f)
+	vfses := active[configName]
+	for i, activeVFS := range vfses {
+		if activeVFS == vfs {
+			name := configName
+			if len(vfses) > 1 {
+				name = fmt.Sprintf("%s[%d]", configName, i)
+			}
+			mountPointsMu.Lock()
+			mountPoints[name] = mountPoint
+			mountPointsMu.Unlock()
+			vfs.MountPoint = mountPoint
+			return
+		}
+	}
+}
+
+// UnregisterMountPointForVFS finds the VFS in the active cache and
+// unregisters its mount point using the correct indexed name.
+func UnregisterMountPointForVFS(vfs *VFS) {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	configName := fs.ConfigString(vfs.f)
+	vfses := active[configName]
+	for i, activeVFS := range vfses {
+		if activeVFS == vfs {
+			name := configName
+			if len(vfses) > 1 {
+				name = fmt.Sprintf("%s[%d]", configName, i)
+			}
+			mountPointsMu.Lock()
+			delete(mountPoints, name)
+			mountPointsMu.Unlock()
+			vfs.MountPoint = ""
+			return
+		}
+	}
+}
 
 // GetVFS gets a VFS with config name "fs" from the cache or returns an error.
 //
@@ -390,7 +482,11 @@ This lists the active VFSes.
 
 It returns a list under the key "vfses" where the values are the VFS
 names that could be passed to the other VFS commands in the "fs"
-parameter.`,
+parameter.
+
+It also returns a "mountPoints" object mapping each VFS name to its
+mount point path, or null for a VFS created without a mount point
+(in-process, remote-control, or serve usage).`,
 		Fn: rcList,
 	})
 }
@@ -399,17 +495,33 @@ func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	activeMu.Lock()
 	defer activeMu.Unlock()
 	var names = []string{}
+	mountPointsMap := make(map[string]any)
 	for name, vfses := range active {
 		if len(vfses) == 1 {
 			names = append(names, name)
+			// Check if this VFS has a mount point
+			mountPoint := GetMountPoint(name)
+			if mountPoint != "" {
+				mountPointsMap[name] = mountPoint
+			} else {
+				mountPointsMap[name] = nil
+			}
 		} else {
 			for i := range vfses {
-				names = append(names, fmt.Sprintf("%s[%d]", name, i))
+				indexedName := fmt.Sprintf("%s[%d]", name, i)
+				names = append(names, indexedName)
+				mountPoint := GetMountPoint(indexedName)
+				if mountPoint != "" {
+					mountPointsMap[indexedName] = mountPoint
+				} else {
+					mountPointsMap[indexedName] = nil
+				}
 			}
 		}
 	}
 	out = rc.Params{}
 	out["vfses"] = names
+	out["mountPoints"] = mountPointsMap
 	return out, nil
 }
 
@@ -604,8 +716,373 @@ are the per-path result objects.
 // rcFileStatus reports the local cache and upload state of the
 // files named in the "paths" parameter.
 func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	// TODO: implement the decision order (specs/001-vfs-file-status/spec.md
-	// FR-006). Until then the endpoint answers every request with the
-	// whole-request empty_path rejection of contracts/api.md.
-	return nil, errors.New("empty_path: paths is empty or an entry is not absolute")
+	// Decision order level 1: Request shape validation
+	// Check paths parameter exists and is an array
+	pathsRaw, ok := in["paths"]
+	if !ok {
+		return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", 400)
+	}
+
+	// Handle both []any and []string (the latter is what Go produces for JSON arrays of strings)
+	var pathsSlice []any
+	switch v := pathsRaw.(type) {
+	case []any:
+		pathsSlice = v
+	case []string:
+		pathsSlice = make([]any, len(v))
+		for i, s := range v {
+			pathsSlice[i] = s
+		}
+	default:
+		return nil, rc.NewFileStatusError("param_invalid", "paths must be an array", 400)
+	}
+
+	if len(pathsSlice) == 0 {
+		return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", 400)
+	}
+
+	// Convert to string slice, checking for non-string entries
+	paths := make([]string, len(pathsSlice))
+	for i, v := range pathsSlice {
+		s, ok := v.(string)
+		if !ok {
+			return nil, rc.NewFileStatusError("param_invalid", "paths entries must be strings", 400)
+		}
+		paths[i] = s
+	}
+
+	// Check all paths are absolute (after cleaning)
+	for _, path := range paths {
+		cleaned := filepath.Clean(path)
+		if !filepath.IsAbs(cleaned) {
+			return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", 400)
+		}
+	}
+
+	// Decision order level 2: Identifier resolution
+	// Get the fs parameter if provided
+	fsString, err := in.GetString("fs")
+	hasFsParam := err == nil
+	if err != nil && !rc.IsErrParamNotFound(err) {
+		return nil, err
+	}
+
+	var vfsInstance *VFS
+	var vfsName string
+
+	if hasFsParam {
+		// Identifier provided - resolve it
+		activeMu.Lock()
+		fsString = cache.Canonicalize(fsString)
+		activeVFS := active[fsString]
+		activeMu.Unlock()
+
+		if len(activeVFS) == 0 {
+			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("no VFS found with name %q", fsString), 400)
+		} else if len(activeVFS) > 1 {
+			// Check if fsString contains an index suffix like "name[1]"
+			// For now, if multiple VFSes with same name and no index, it's ambiguous
+			// But the indexed name should have been provided
+			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("more than one VFS active with name %q", fsString), 400)
+		}
+		vfsInstance = activeVFS[0]
+		vfsName = fsString
+	} else {
+		// No identifier provided
+		if len(paths) > 1 {
+			return nil, rc.NewFileStatusError("ambiguous_mount", "multiple paths provided but no fs parameter", 400)
+		}
+		// Single path - resolve against mount points
+		singlePath := filepath.Clean(paths[0])
+		vfsInstance, vfsName = resolveVFSForPath(singlePath)
+		if vfsInstance == nil {
+			// Path is outside any mount point
+			return buildSinglePathResponse(singlePath, "outside_any_mount", "path lies outside any registered mount point"), nil
+		}
+	}
+
+	// Now we have a single VFS to query
+	// Decision order level 3: Per-path classification
+	var results []map[string]any
+	for _, path := range paths {
+		cleaned := filepath.Clean(path)
+		result := classifyPath(vfsInstance, vfsName, cleaned, hasFsParam)
+		results = append(results, result)
+	}
+
+	out = rc.Params{
+		"statuses": results,
+	}
+	return out, nil
+}
+
+// resolveVFSForPath finds the VFS that owns the given path by checking
+// registered mount points. Returns the VFS and its indexed name, or nil if
+// the path is not inside any registered mount point.
+func resolveVFSForPath(path string) (*VFS, string) {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+
+	// Find the longest matching mount point
+	var bestMatch string
+	var bestName string
+	var bestVFS *VFS
+
+	for name, mountPoint := range mountPoints {
+		if mountPoint == "" {
+			continue
+		}
+		cleanMP := filepath.Clean(mountPoint)
+		cleanPath := filepath.Clean(path)
+
+		// Check if path is inside this mount point
+		if isPathInsideMountPoint(cleanPath, cleanMP) {
+			// Prefer the longest mount point (most specific)
+			if len(cleanMP) > len(bestMatch) {
+				bestMatch = cleanMP
+				bestName = name
+			}
+		}
+	}
+
+	if bestName == "" {
+		return nil, ""
+	}
+
+	// Find the VFS for this name
+	activeMu.Lock()
+	defer activeMu.Unlock()
+
+	// Parse the name to get config name and index
+	configName, index := parseIndexedName(bestName)
+	vfses := active[configName]
+	if index >= 0 && index < len(vfses) {
+		bestVFS = vfses[index]
+	} else if len(vfses) == 1 && index == -1 {
+		bestVFS = vfses[0]
+	}
+
+	return bestVFS, bestName
+}
+
+// parseIndexedName parses a name like "mydrive[1]" into ("mydrive", 1)
+// or returns ("mydrive", -1) if no index suffix.
+func parseIndexedName(name string) (string, int) {
+	if strings.HasSuffix(name, "]") {
+		bracket := strings.LastIndex(name, "[")
+		if bracket > 0 {
+			indexStr := name[bracket+1 : len(name)-1]
+			if idx, err := strconv.Atoi(indexStr); err == nil {
+				return name[:bracket], idx
+			}
+		}
+	}
+	return name, -1
+}
+
+// isPathInsideMountPoint checks if path is inside mountPoint (at component boundary)
+func isPathInsideMountPoint(path, mountPoint string) bool {
+	if path == mountPoint {
+		return true
+	}
+	// Check if path starts with mountPoint + separator
+	prefix := mountPoint + string(filepath.Separator)
+	return strings.HasPrefix(path, prefix)
+}
+
+// classifyPath classifies a single path against a VFS and returns the result object.
+// If hasFsParam is true, the caller provided an "fs" identifier, so we use the
+// VFS's remote root as the effective mount point when no explicit mount point exists.
+func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[string]any {
+	// Determine the effective mount point
+	mountPoint := vfsInstance.MountPoint
+	if mountPoint == "" && hasFsParam {
+		// VFS has no mount point but we have an fs identifier - use the remote's root
+		mountPoint = vfsInstance.f.Root()
+	}
+
+	if mountPoint == "" {
+		// VFS has no mount point and no fs identifier - path is outside
+		return buildErrorResult(path, "outside_any_mount", "VFS has no mount point")
+	}
+
+	cleanMP := filepath.Clean(mountPoint)
+	cleanPath := filepath.Clean(path)
+
+	if !isPathInsideMountPoint(cleanPath, cleanMP) {
+		return buildErrorResult(path, "outside_any_mount", "path lies outside the mount point")
+	}
+
+	// Check for overlapping mount points (path inside more than one)
+	// Only check for overlap when we don't have an fs identifier (identifier-less resolution)
+	// When fs is provided, we already know which VFS we're querying
+	if !hasFsParam && isPathInMultipleMountPoints(cleanPath) {
+		return buildErrorResult(path, "ambiguous_mount", "path lies inside multiple mount points")
+	}
+
+	// Get the relative path within the mount
+	relPath, err := filepath.Rel(cleanMP, cleanPath)
+	if err != nil {
+		return buildErrorResult(path, "outside_any_mount", "path is not relative to mount point")
+	}
+
+	// Check if the path exists in the VFS
+	root, err := vfsInstance.Root()
+	if err != nil {
+		return buildErrorResult(path, "unaccountable_path", "cannot access VFS root")
+	}
+
+	// Walk the path to find the entry
+	node, parentDir, err := walkToEntry(root, relPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Check if parent is known
+			if parentDir != nil {
+				// Parent directory is known - check if the file exists on the remote
+				// This handles the case where a file was added to the remote after the
+				// directory was cached (FR-008, FR-033)
+				cachePath := relPath
+				if o, err := vfsInstance.f.NewObject(vfsInstance.ctx, cachePath); err == nil && o != nil {
+					// File exists on remote but not in cache - treat as regular file with no cache entry
+					isLink := false
+					cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
+					status := fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
+					return buildStatusResult(path, status, cacheOff)
+				}
+				// File doesn't exist on remote either
+				return buildErrorResult(path, "not_found", "file does not exist in mount")
+			}
+			return buildErrorResult(path, "unaccountable_path", "parent directory not known")
+		}
+		return buildErrorResult(path, "unaccountable_path", err.Error())
+	}
+
+	// Check if it's a directory
+	if node != nil && node.IsDir() {
+		return buildErrorResult(path, "directory_not_file", "path names a directory")
+	}
+
+	// Check if it's a symlink (non-regular file)
+	if node != nil && vfsInstance.Opt.Links && isSymlink(node) {
+		// Non-regular file
+		return buildNonRegularFileResult(vfsInstance, path)
+	}
+
+	// Regular file - get its status
+	cachePath := relPath
+	if cachePath == "." {
+		cachePath = ""
+	}
+	isLink := false // Final component is not a symlink (we checked above)
+	cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
+
+	status := fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
+	return buildStatusResult(path, status, cacheOff)
+}
+
+// isPathInMultipleMountPoints checks if a path is inside more than one registered mount point.
+func isPathInMultipleMountPoints(path string) bool {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+
+	count := 0
+	for _, mountPoint := range mountPoints {
+		if mountPoint == "" {
+			continue
+		}
+		cleanMP := filepath.Clean(mountPoint)
+		if isPathInsideMountPoint(path, cleanMP) {
+			count++
+			if count > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// walkToEntry walks the VFS tree to find the entry for the given relative path.
+// Returns the node, its parent directory, and any error.
+func walkToEntry(root *Dir, relPath string) (Node, *Dir, error) {
+	if relPath == "" || relPath == "." {
+		return root, nil, nil // Root directory
+	}
+
+	segments := strings.Split(relPath, string(filepath.Separator))
+	var node Node = root
+	var parentDir *Dir
+
+	for i, segment := range segments {
+		if dir, ok := node.(*Dir); ok {
+			parentDir = dir
+			child, err := dir.stat(segment)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, parentDir, err
+				}
+				return nil, parentDir, err
+			}
+			node = child
+		} else {
+			// Not a directory, can't traverse further
+			return nil, parentDir, fmt.Errorf("not a directory")
+		}
+		// If this is the last segment, we found the entry
+		if i == len(segments)-1 {
+			return node, parentDir, nil
+		}
+	}
+	return node, parentDir, nil
+}
+
+// isSymlink checks if a node is a symlink
+func isSymlink(node Node) bool {
+	if f, ok := node.(*File); ok {
+		return f.IsSymlink()
+	}
+	return false
+}
+
+// buildErrorResult creates a per-path error result.
+func buildErrorResult(path, code, message string) map[string]any {
+	return map[string]any{
+		"path": path,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	}
+}
+
+// buildNonRegularFileResult creates a result for a non-regular file (symlink).
+func buildNonRegularFileResult(vfsInstance *VFS, path string) map[string]any {
+	cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
+	status := FileStatus{
+		Local:  FileLocalNotRegularFile,
+		Upload: FileUploadNotApplicable,
+		Bytes: FileByteInfo{
+			TotalKnown: false,
+		},
+		IsDir: false,
+	}
+	if cacheOff {
+		status.Upload = FileUploadNotTracked
+	}
+	return buildStatusResult(path, status, cacheOff)
+}
+
+// buildStatusResult creates a success result from a FileStatus.
+func buildStatusResult(path string, status FileStatus, cacheOff bool) map[string]any {
+	result := status.ToParams()
+	result["path"] = path
+	return result
+}
+
+// buildSinglePathResponse builds a response for a single path with an error.
+func buildSinglePathResponse(path, code, message string) rc.Params {
+	return rc.Params{
+		"statuses": []map[string]any{
+			buildErrorResult(path, code, message),
+		},
+	}
 }

@@ -251,9 +251,12 @@ func newFileStatusFailureFixture(t *testing.T, opt *vfscommon.Options) (*fstest.
 
 func (fixture *fileStatusFailureFixture) start(t *testing.T, opt *vfscommon.Options) {
 	t.Helper()
-	fixture.vfs = New(context.Background(), fixture.remote, opt)
-	// This local VFS exposes its remote root as the endpoint's host path.
-	fixture.vfs.MountPoint = fixture.remote.Root()
+	localOpt := *opt
+	localOpt.DirCacheTime = fs.Duration(time.Hour)
+	fixture.vfs = New(context.Background(), fixture.remote, &localOpt)
+	mountPoint := fixture.remote.Root()
+	RegisterMountPointForVFS(fixture.vfs, mountPoint)
+	require.Equal(t, mountPoint, GetMountPoint(fs.ConfigString(fixture.remote)))
 	fixture.call = rc.Calls.Get("vfs/file-status")
 	require.NotNil(t, fixture.call)
 	require.Equal(t, fs.ConfigString(fixture.remote.Fs), fs.ConfigString(fixture.remote))
@@ -261,6 +264,7 @@ func (fixture *fileStatusFailureFixture) start(t *testing.T, opt *vfscommon.Opti
 
 func (fixture *fileStatusFailureFixture) restart(t *testing.T, opt *vfscommon.Options) {
 	t.Helper()
+	UnregisterMountPointForVFS(fixture.vfs)
 	fixture.vfs.Shutdown()
 	fixture.vfs = nil
 	fixture.start(t, opt)
@@ -273,6 +277,7 @@ func (fixture *fileStatusFailureFixture) close(t *testing.T) {
 	}
 	vfs := fixture.vfs
 	fixture.vfs = nil
+	UnregisterMountPointForVFS(vfs)
 	vfs.Shutdown()
 	require.NoError(t, vfs.CleanUp())
 }

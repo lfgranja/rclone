@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -68,9 +70,22 @@ type Item struct {
 	writeBackID     writeback.Handle         // id of any writebacks in progress
 	pendingAccesses int                      // number of threads - cache reset not allowed if not zero
 	modified        bool                     // set if the file has been modified since the last Open
-	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
+	beingReset      atomic.Bool              // cache cleaner is resetting the cache file, access not allowed (atomic so status reads observe it without waiting on mu, FR-026)
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	// In-memory transfer outcome for status reporting (FR-028).
+	// Set when an attempt fails, cleared only when a later attempt
+	// of the same file succeeds; never cleared by a retry being
+	// scheduled, never persisted, so a restart drops them and the
+	// file is reported as awaiting_upload again (FR-031).
+	downloadErr error // last download attempt error, nil if the last attempt succeeded
+	uploadErr   error // last upload attempt error, nil if the last attempt succeeded
+	// uploadCompleted records that this mount instance completed an
+	// upload of the file's current content. It distinguishes a file
+	// written through the mount and uploaded (uploaded) from one
+	// merely read into the cache (not_applicable); it is cleared by
+	// any local modification and, being in-memory, by a restart.
+	uploadCompleted bool
 }
 
 // Info is persisted to backing store
@@ -433,6 +448,13 @@ func (item *Item) Exists() bool {
 func (item *Item) _dirty() {
 	item.info.ModTime = time.Now()
 	item.info.ATime = item.info.ModTime
+	// New local content supersedes whatever was downloaded before:
+	// the held download bytes (if any) no longer describe a fetcher
+	// outcome, and the content is no longer what a previous upload
+	// delivered. The upload failure, if any, is kept: the last
+	// attempt did fail and only a later success clears it (FR-028).
+	item.downloadErr = nil
+	item.uploadCompleted = false
 	if !item.modified {
 		item.modified = true
 		item.mu.Unlock()
@@ -494,11 +516,10 @@ func (item *Item) GetDownloadersError() (errorCount int, lastErr error) {
 
 // IsBeingReset returns true if the cache cleaner is currently
 // resetting this item's cache file. Used to report underivable
-// without blocking (FR-026).
+// without blocking (FR-026). It reads an atomic flag, so unlike the
+// per-file record lock it never waits on a reset in progress.
 func (item *Item) IsBeingReset() bool {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	return item.beingReset
+	return item.beingReset.Load()
 }
 
 // GetFingerprint returns the remote object fingerprint, or empty
@@ -529,6 +550,151 @@ func (item *Item) GetSizeLocked() int64 {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 	return item.info.Size
+}
+
+// ItemSnapshot is one coherent per-file observation for status
+// reporting (FR-016/FR-022): every field is read under a single
+// acquisition of the item's lock, so the local fact, the upload fact
+// and the byte quantities derived from it never combine values taken
+// from two different instants of the file's record.
+type ItemSnapshot struct {
+	// Resetting reports that a cache reset was rewriting the record
+	// when it was observed; the held bytes are underivable (FR-026).
+	Resetting bool
+	// Size is the recorded total size, -ve where unknown (FR-002).
+	Size int64
+	// Rs are the held byte ranges, a copy owned by the snapshot.
+	Rs ranges.Ranges
+	// Dirty reports local modifications not yet uploaded.
+	Dirty bool
+	// WriteBackID identifies any writeback queue entry.
+	WriteBackID writeback.Handle
+	// Fingerprint is the remote object fingerprint, if any.
+	Fingerprint string
+	// DownloadErr is the last download attempt's error, nil where
+	// the last attempt succeeded (FR-028).
+	DownloadErr error
+	// UploadErr is the last upload attempt's error, nil where the
+	// last attempt succeeded (FR-028).
+	UploadErr error
+	// UploadCompleted records that this mount instance completed an
+	// upload of the current content (FR-003/FR-031).
+	UploadCompleted bool
+}
+
+// snapshotLocked copies the item's record; call with mu held.
+func (item *Item) snapshotLocked() ItemSnapshot {
+	var rs ranges.Ranges
+	if item.info.Rs != nil {
+		rs = make(ranges.Ranges, len(item.info.Rs))
+		copy(rs, item.info.Rs)
+	}
+	return ItemSnapshot{
+		Size:            item.info.Size,
+		Rs:              rs,
+		Dirty:           item.info.Dirty,
+		WriteBackID:     item.writeBackID,
+		Fingerprint:     item.info.Fingerprint,
+		DownloadErr:     item.downloadErr,
+		UploadErr:       item.uploadErr,
+		UploadCompleted: item.uploadCompleted,
+	}
+}
+
+// statusSnapshotSpin bounds how long a status read spins on a busy
+// record lock while confirming the holder is not a cache reset: far
+// below the SC-010 ceiling, far above a reset's flag-setting window.
+const statusSnapshotSpin = 5 * time.Millisecond
+
+// SnapshotForStatus takes one coherent observation of the item's
+// record without waiting on a cache reset rewriting it (FR-026): a
+// reset in progress is reported as resetting, and the caller reports
+// underivable rather than the momentary value caught.
+func (item *Item) SnapshotForStatus() (snap ItemSnapshot, resetting bool) {
+	// take copies the record; call with mu held, which it releases.
+	take := func() (ItemSnapshot, bool) {
+		snap := item.snapshotLocked()
+		resetting := item.beingReset.Load()
+		item.mu.Unlock()
+		if resetting {
+			return ItemSnapshot{}, true
+		}
+		return snap, false
+	}
+	// A reset rewriting the record is observed without taking the
+	// record lock at all, so the read never waits on it.
+	if item.beingReset.Load() {
+		return ItemSnapshot{}, true
+	}
+	if item.mu.TryLock() {
+		return take()
+	}
+	// The lock is busy for another reason. Spin briefly to tell a
+	// reset — which sets the flag while holding the lock — from local
+	// disk work on the file, which a read may wait for (FR-026).
+	deadline := time.Now().Add(statusSnapshotSpin)
+	for {
+		if item.beingReset.Load() {
+			return ItemSnapshot{}, true
+		}
+		if item.mu.TryLock() {
+			return take()
+		}
+		if time.Now().After(deadline) {
+			item.mu.Lock()
+			return take()
+		}
+		runtime.Gosched()
+	}
+}
+
+// ProbeSnapshot returns a coherent observation of the named file's
+// record for status reporting without changing published cache totals
+// (FR-005): unlike Item it never inserts an entry into the cache
+// index. Where the index holds no entry but the persisted per-file
+// record survives on disk — between a restart and the file being
+// re-queued, for example — the record is read back transiently, the
+// same durable state the restart guarantee is read from
+// (FR-030/FR-031), and discarded.
+func (c *Cache) ProbeSnapshot(name string) (snap ItemSnapshot, found bool) {
+	name = clean(name)
+	c.mu.Lock()
+	item := c.item[name]
+	c.mu.Unlock()
+	if item != nil {
+		snap, resetting := item.SnapshotForStatus()
+		if resetting {
+			return ItemSnapshot{Resetting: true}, true
+		}
+		return snap, true
+	}
+	return probePersistedSnapshot(c, name)
+}
+
+// probePersistedSnapshot reads the persisted per-file record without
+// inserting it into the index and without touching cached content: a
+// pure local read. It reports false where no usable record survives.
+func probePersistedSnapshot(c *Cache, name string) (ItemSnapshot, bool) {
+	// A record without its data file is not one the mount can account
+	// for; reaching it through a real open would drop it.
+	if _, err := os.Stat(c.toOSPath(name)); err != nil {
+		return ItemSnapshot{}, false
+	}
+	in, err := os.Open(c.toOSPathMeta(name))
+	if err != nil {
+		return ItemSnapshot{}, false
+	}
+	defer func() { _ = in.Close() }()
+	var info Info
+	if err := json.NewDecoder(in).Decode(&info); err != nil {
+		return ItemSnapshot{}, false
+	}
+	return ItemSnapshot{
+		Size:        info.Size,
+		Rs:          info.Rs,
+		Dirty:       info.Dirty,
+		Fingerprint: info.Fingerprint,
+	}, true
 }
 
 // Create the cache file and store the metadata on disk
@@ -726,6 +892,9 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 				fs.Errorf(name, "Writeback failed: %v", err)
 				return nil
 			}
+			// Record the failure for the life of the mount; only
+			// a later successful transfer clears it (FR-028).
+			item.uploadErr = err
 			return fmt.Errorf("vfs cache: failed to transfer file from cache to remote: %w", err)
 		}
 		item.o = o
@@ -746,6 +915,10 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 
 	// Show item is clean and is eligible for cache removal
 	item.info.Dirty = false
+	// The transfer succeeded: the failure (if any) is cleared and
+	// the completion is recorded for this mount instance (FR-028).
+	item.uploadErr = nil
+	item.uploadCompleted = true
 	err = item._save()
 	if err != nil {
 		fs.Errorf(item.name, "vfs cache: failed to write metadata file: %v", err)
@@ -1150,11 +1323,11 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 
 	/* Do not need to reset an empty cache file unless it was being reset and the reset failed.
 	   Some thread(s) may be waiting on the reset's successful completion in that case. */
-	if item.info.Rs.Size() == 0 && !item.beingReset {
+	if item.info.Rs.Size() == 0 && !item.beingReset.Load() {
 		return SkippedEmpty, 0, nil
 	}
 
-	item.beingReset = true
+	item.beingReset.Store(true)
 
 	/* Error handling from this point on (setting item.fd and item.beingReset):
 	   Since Reset is called by the cache cleaner thread, there is no direct way to return
@@ -1197,7 +1370,7 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 		checkErr(item.fd.Close())
 		if err != nil {
 			// Could not close the cache file
-			item.beingReset = false
+			item.beingReset.Store(false)
 			item.cond.Broadcast()
 			return ResetFailed, 0, err
 		}
@@ -1215,7 +1388,7 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 	fso := item.o
 	checkErr(item._checkObject(fso))
 	if err != nil {
-		item.beingReset = false
+		item.beingReset.Store(false)
 		item.cond.Broadcast()
 		return ResetFailed, spaceFreed, err
 	}
@@ -1226,7 +1399,7 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 		item._remove("cache reset failed on _createFile, removed cache data file")
 		item.fd = nil // This allows a new Reset redo to have a clean state to deal with
 		if !fserrors.IsErrNoSpace(err) {
-			item.beingReset = false
+			item.beingReset.Store(false)
 			item.cond.Broadcast()
 		}
 		return ResetFailed, spaceFreed, err
@@ -1239,7 +1412,7 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 
 	/* The item will stay in the beingReset state if we get an error that prevents us from
 	reaching this point.  The cache purge loop will redo the failed Reset. */
-	item.beingReset = false
+	item.beingReset.Store(false)
 	item.cond.Broadcast()
 
 	return ResetComplete, spaceFreed, err
@@ -1252,10 +1425,10 @@ func (item *Item) preAccess() {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
-	if item.beingReset {
+	if item.beingReset.Load() {
 		for {
 			item.cond.Wait()
-			if !item.beingReset {
+			if !item.beingReset.Load() {
 				break
 			}
 		}
@@ -1337,14 +1510,18 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 	} */
 	fs.Debugf(nil, "vfs cache: looking for range=%+v in %+v - present %v", r, item.info.Rs, present)
 	item.mu.Unlock()
-	defer item.mu.Lock()
 	if present {
 		// This is a file we are writing so no downloaders needed
 		if item.downloaders == nil {
+			item.mu.Lock()
 			return nil
 		}
-		// Otherwise start the downloader for the future if required
-		return item.downloaders.EnsureDownloader(r)
+		// Otherwise start the downloader for the future if required.
+		// A range already present needs no download attempt, so its
+		// outcome leaves any recorded download failure untouched.
+		err = item.downloaders.EnsureDownloader(r)
+		item.mu.Lock()
+		return err
 	}
 	if item.downloaders == nil {
 		// Downloaders can be nil here if the file has been
@@ -1357,13 +1534,25 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 		if item.o == nil {
 			o, err := item.c.fremote.NewObject(item.c.ctx, item.name)
 			if err != nil {
+				item.mu.Lock()
 				return err
 			}
 			item.o = o
 		}
 		item.downloaders = downloaders.New(item.c.ctx, item, item.c.opt, item.name, item.o)
 	}
-	return item.downloaders.Download(r)
+	err = item.downloaders.Download(r)
+	// Record the outcome of this download attempt on the item: a
+	// failure is reported for the life of the mount, and only a
+	// later successful attempt of the same file clears it — a retry
+	// being scheduled clears nothing (FR-028).
+	item.mu.Lock()
+	if err != nil {
+		item.downloadErr = err
+	} else {
+		item.downloadErr = nil
+	}
+	return err
 }
 
 // _written marks the (offset, size) as present in the backing file

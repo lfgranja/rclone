@@ -230,6 +230,21 @@ jobs:
           make racequicktest
         if: matrix.racequicktest
 
+      - name: VFS file-status BCE gate
+        run: |
+          # Backward-compatibility gate for vfs/file-status (SC-026): the
+          # normalized fixtures in vfs/testdata/file_status must match the
+          # endpoint's stable fields, and CI fails on any baseline diff.
+          # FILE_STATUS_UPDATE_FIXTURES is never set here: recapture is a
+          # deliberate local run whose diff is reviewed and committed, e.g.
+          #   FILE_STATUS_UPDATE_FIXTURES=1 go test ./vfs/ -run 'TestFileStatusBCE' -count=1
+          # Acceptance against a configured remote uses the vfs package with
+          # the -remote flag (never `cd backend/...`), e.g.
+          #   go test ./vfs/ -remote TestDrive:
+          # which skips without credentials by design.
+          RCLONE_CONFIG="/notfound" go test ./vfs/ -run 'TestFileStatusBCE' -count=1
+        if: matrix.quicktest
+
       - name: Run librclone tests
         run: |
           make -C librclone/ctest test

@@ -156,6 +156,8 @@ func fileStatusNewRun(t *testing.T, method string) (r *fstest.Run, vfs *VFS, cal
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeMinimal
 	r, vfs = newTestVFSOpt(t, &opt)
+	RegisterMountPointForVFS(vfs, r.Fremote.Root())
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
 	call = rc.Calls.Get(method)
 	require.NotNil(t, call)
 	return r, vfs, call
@@ -176,6 +178,8 @@ func fileStatusNewRunFull(t *testing.T, method string) (r *fstest.Run, vfs *VFS,
 	opt.CacheMode = vfscommon.CacheModeFull
 	opt.HandleCaching = 0
 	r, vfs = newTestVFSOpt(t, &opt)
+	RegisterMountPointForVFS(vfs, r.Fremote.Root())
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
 	call = rc.Calls.Get(method)
 	require.NotNil(t, call)
 	return r, vfs, call

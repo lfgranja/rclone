@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -952,6 +953,14 @@ func resolveVFSForPath(path string) (*VFS, string) {
 	mountPointsMu.Unlock()
 
 	cleanPath := filepath.Clean(path)
+	// Resolve parent links without following the final component so
+	// an alias parent still selects its target mount; a dangling
+	// parent names nothing reachable (outside).
+	if resolved, ok := resolvePathForMatching(cleanPath); !ok {
+		return nil, ""
+	} else {
+		cleanPath = resolved
+	}
 	// Collect every live candidate: display points resolve through
 	// their indexed names, aliases carry their VFS directly.
 	type candidate struct {
@@ -1067,8 +1076,23 @@ func parseIndexedName(name string) (string, int) {
 	return name, -1
 }
 
-// isPathInsideMountPoint checks if path is inside mountPoint (at component boundary)
+// isPathInsideMountPoint checks if path is inside mountPoint (at component boundary).
+// Matching is case-insensitive on Windows and case-sensitive elsewhere,
+// with boundary awareness so a sibling sharing the prefix is outside.
 func isPathInsideMountPoint(path, mountPoint string) bool {
+	if runtime.GOOS == "windows" {
+		if strings.EqualFold(path, mountPoint) {
+			return true
+		}
+		if len(path) <= len(mountPoint) {
+			return false
+		}
+		if !strings.EqualFold(path[:len(mountPoint)], mountPoint) {
+			return false
+		}
+		c := path[len(mountPoint)]
+		return c == '\\' || c == '/'
+	}
 	if path == mountPoint {
 		return true
 	}
@@ -1083,10 +1107,51 @@ func isPathInsideMountPoint(path, mountPoint string) bool {
 	return strings.HasPrefix(path, prefix)
 }
 
+// resolvePathForMatching resolves parent symlinks without following the
+// final component, so a path reaching a mount through a linked parent
+// is answered by that mount per FR-009/FR-032. It returns the resolved
+// path for mount matching; false means a dangling parent link names
+// nothing reachable (outside_any_mount). Non-existent VFS-only
+// intermediates are kept lexically so virtual paths still match.
+func resolvePathForMatching(requestPath string) (string, bool) {
+	cleaned := filepath.Clean(requestPath)
+	parent := filepath.Dir(cleaned)
+	base := filepath.Base(cleaned)
+	if parent == cleaned {
+		return cleaned, true
+	}
+	candidate := parent
+	var remainder []string
+	for {
+		if _, err := os.Lstat(candidate); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return cleaned, true
+		}
+		next := filepath.Dir(candidate)
+		if next == candidate {
+			break
+		}
+		remainder = append([]string{filepath.Base(candidate)}, remainder...)
+		candidate = next
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", false
+	}
+	resolvedParent := resolvedCandidate
+	for _, part := range remainder {
+		resolvedParent = filepath.Join(resolvedParent, part)
+	}
+	return filepath.Clean(filepath.Join(resolvedParent, base)), true
+}
+
 // classifyPath classifies a single path against a VFS and returns the result object.
 // A VFS without a mount point never answers a host path: no point is
 // synthesized for null-mount VFSes, so every host path is
-// outside_any_mount per FR-009/FR-014.
+// outside_any_mount per FR-009/FR-014. Parent links are followed to
+// decide the mount while the final component is never followed per
+// FR-009/FR-032; overlapping matches are ambiguous with no tiebreak.
 func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[string]any {
 	// Determine the effective mount point from the Held selection.
 	// Never synthesize a point for a VFS whose mount point is null.
@@ -1098,20 +1163,30 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 
 	cleanMP := filepath.Clean(mountPoint)
 	cleanPath := filepath.Clean(path)
+	// Resolve parent links for mount matching; a dangling parent is outside.
+	resolvedPath := cleanPath
+	if resolved, ok := resolvePathForMatching(cleanPath); !ok {
+		return buildErrorResult(path, "outside_any_mount", "parent link target does not exist")
+	} else {
+		resolvedPath = resolved
+	}
 
-	if !isPathInsideMountPoint(cleanPath, cleanMP) {
+	if !isPathInsideMountPoint(resolvedPath, cleanMP) {
 		return buildErrorResult(path, "outside_any_mount", "path lies outside the mount point")
 	}
 
 	// Check for overlapping mount points (path inside more than one)
 	// Only check for overlap when we don't have an fs identifier (identifier-less resolution)
-	// When fs is provided, we already know which VFS we're querying
-	if !hasFsParam && isPathInMultipleMountPoints(cleanPath) {
+	// When fs is provided, we already know which VFS we're querying.
+	// No longest-prefix or first-registered tiebreak: any second match
+	// is the ambiguity failure.
+	if !hasFsParam && isPathInMultipleMountPoints(resolvedPath) {
 		return buildErrorResult(path, "ambiguous_mount", "path lies inside multiple mount points")
 	}
 
-	// Get the relative path within the mount
-	relPath, err := filepath.Rel(cleanMP, cleanPath)
+	// Get the relative path within the mount from the resolved path so
+	// an alias parent still maps to the entry it serves.
+	relPath, err := filepath.Rel(cleanMP, resolvedPath)
 	if err != nil {
 		return buildErrorResult(path, "outside_any_mount", "path is not relative to mount point")
 	}

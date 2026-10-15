@@ -1041,43 +1041,16 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 		return buildErrorResult(path, "unaccountable_path", "cannot access VFS root")
 	}
 
-	// Walk the path to find the entry
-	node, parentDir, err := walkToEntry(root, relPath)
+	// Walk the path to find the entry using current local listings only.
+	// not_found comes only from a current listing; a parent with no
+	// current listing is unaccountable. No remote NewObject,
+	// directory-list or listing-refresh call is made below the root.
+	node, _, err := walkToEntry(root, relPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Check if parent is known
-			if parentDir != nil {
-				// Parent directory is known - check if the file exists on the remote
-				// This handles the case where a file was added to the remote after the
-				// directory was cached (FR-008, FR-033)
-				cachePath := relPath
-				if o, err := vfsInstance.f.NewObject(vfsInstance.ctx, cachePath); err == nil && o != nil {
-					// File exists on remote but not in cache - treat as regular file with no cache entry
-					// Construct status directly to avoid cache lookup which might return a stale item
-					cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
-					size := o.Size()
-					var upload FileUploadState
-					if cacheOff {
-						upload = FileUploadNotTracked
-					} else {
-						upload = FileUploadNotApplicable
-					}
-					status := FileStatus{
-						Local:  FileLocalNotHeld,
-						Upload: upload,
-						Bytes: FileByteInfo{
-							UnbrokenRun: 0,
-							TotalHeld:   0,
-							TotalSize:   size,
-							TotalKnown:  true,
-						},
-						IsDir: false,
-					}
-					return buildStatusResult(path, status, cacheOff)
-				}
-				// File doesn't exist on remote either
-				return buildErrorResult(path, "not_found", "file does not exist in mount")
-			}
+		if errors.Is(err, ENOENT) || os.IsNotExist(err) {
+			return buildErrorResult(path, "not_found", "file does not exist in mount")
+		}
+		if errors.Is(err, errUnaccountable) {
 			return buildErrorResult(path, "unaccountable_path", "parent directory not known")
 		}
 		return buildErrorResult(path, "unaccountable_path", err.Error())
@@ -1094,7 +1067,10 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 		return buildNonRegularFileResult(vfsInstance, path)
 	}
 
-	// Regular file - get its status
+	// Regular file - get its status without any remote call. The size
+	// comes from the directory entry the mount already holds; a file
+	// with no cache item is not_held with that size, so no NewObject
+	// lookup is made per FR-002/FR-005.
 	cachePath := relPath
 	if cachePath == "." {
 		cachePath = ""
@@ -1102,8 +1078,61 @@ func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[s
 	isLink := false // Final component is not a symlink (we checked above)
 	cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
 
-	status := fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
+	var status FileStatus
+	if cacheOff {
+		size := node.Size()
+		status = FileStatus{
+			Local:  FileLocalNotHeld,
+			Upload: FileUploadNotTracked,
+			Bytes: FileByteInfo{
+				UnbrokenRun: 0,
+				TotalHeld:   0,
+				TotalSize:   size,
+				TotalKnown:  size >= 0,
+			},
+			IsDir: false,
+		}
+	} else if vfsInstance.cache == nil || vfsInstance.cache.Item(cachePath) == nil {
+		size := node.Size()
+		status = FileStatus{
+			Local:  FileLocalNotHeld,
+			Upload: FileUploadNotApplicable,
+			Bytes: FileByteInfo{
+				UnbrokenRun: 0,
+				TotalHeld:   0,
+				TotalSize:   size,
+				TotalKnown:  size >= 0,
+			},
+			IsDir: false,
+		}
+	} else {
+		status = fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
+	}
 	return buildStatusResult(path, status, cacheOff)
+}
+
+// errUnaccountable reports that the mount holds no current listing of
+// the path's parent, so existence cannot be established from local
+// listings alone per FR-012/FR-033.
+var errUnaccountable = errors.New("parent listing not current")
+
+// dirListingCurrent reports whether d holds a current listing without
+// triggering a remote refresh. It mirrors Dir._age so a status read
+// never lists a directory to establish existence per FR-005/FR-033.
+func dirListingCurrent(d *Dir) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	_, stale := d._age(time.Now())
+	return !stale
+}
+
+// cachedChild returns the named child from the directory's current
+// items without refreshing the listing. No remote call is made.
+func cachedChild(d *Dir, leaf string) (Node, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	node, ok := d.items[leaf]
+	return node, ok
 }
 
 // isPathInMultipleMountPoints checks if a path is inside more than one registered mount point.
@@ -1129,6 +1158,14 @@ func isPathInMultipleMountPoints(path string) bool {
 
 // walkToEntry walks the VFS tree to find the entry for the given relative path.
 // Returns the node, its parent directory, and any error.
+//
+// The first level may refresh the root listing (dir.stat) so a mount
+// whose root has never been listed can still answer its top-level
+// entries; deeper levels use only current local listings. A missing
+// entry in a current listing is ENOENT (not_found); a path whose
+// parent has no current listing is errUnaccountable. No remote
+// NewObject or listing-refresh call is made below the root per
+// FR-002/FR-005/FR-012/FR-033.
 func walkToEntry(root *Dir, relPath string) (Node, *Dir, error) {
 	if relPath == "" || relPath == "." {
 		return root, nil, nil // Root directory
@@ -1139,20 +1176,33 @@ func walkToEntry(root *Dir, relPath string) (Node, *Dir, error) {
 	var parentDir *Dir
 
 	for i, segment := range segments {
-		if dir, ok := node.(*Dir); ok {
-			parentDir = dir
-			child, err := dir.stat(segment)
+		dir, ok := node.(*Dir)
+		if !ok {
+			// Not a directory, can't traverse further
+			return nil, parentDir, errUnaccountable
+		}
+		parentDir = dir
+		var child Node
+		if i == 0 {
+			var err error
+			child, err = dir.stat(segment)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return nil, parentDir, err
+					return nil, parentDir, ENOENT
 				}
 				return nil, parentDir, err
 			}
-			node = child
 		} else {
-			// Not a directory, can't traverse further
-			return nil, parentDir, fmt.Errorf("not a directory")
+			if !dirListingCurrent(dir) {
+				return nil, parentDir, errUnaccountable
+			}
+			var found bool
+			child, found = cachedChild(dir, segment)
+			if !found {
+				return nil, parentDir, ENOENT
+			}
 		}
+		node = child
 		// If this is the last segment, we found the entry
 		if i == len(segments)-1 {
 			return node, parentDir, nil

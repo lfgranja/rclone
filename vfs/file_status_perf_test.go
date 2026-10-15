@@ -901,20 +901,19 @@ func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
 		for i := 0; i < warmup; i++ {
 			require.NoError(t, read(), "run %d warm-up read %d", run, i)
 		}
-		// One engaged reset and the 100 reads share a
-		// single barrier: every goroutine parks first
-		// (50 ms settle inside the helper), then the
-		// reset is initiated at the window start and
-		// the reads span its window.
+		// One engaged reset and the 100 reads: the reads park
+		// first (50 ms settle), then the reset starts and the
+		// release is gated on the file being observed under
+		// reset — the same IsBeingReset probe each read
+		// samples with — so the reset window contains the
+		// read burst instead of racing it from a shared
+		// barrier. The barrier/allStarted accounting shape
+		// below is the fileStatusBarrierReadsErr pattern:
+		// allStarted gates only the in-flight accounting,
+		// never the timing.
 		release := make(chan struct{})
+		resetDone := make(chan struct{})
 		var outcome fileStatusResetOutcome
-		var resetDone sync.WaitGroup
-		resetDone.Add(1)
-		go func() {
-			defer resetDone.Done()
-			<-release
-			outcome = fileStatusDoReset(vfs, target)
-		}()
 		starts := make([]time.Time, fileStatusReadsPerRun)
 		ends := make([]time.Time, fileStatusReadsPerRun)
 		errs := make([]error, fileStatusReadsPerRun)
@@ -958,12 +957,48 @@ func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
 			}(i)
 		}
 		time.Sleep(50 * time.Millisecond)
+		// Start the reset after the reads are parked so the
+		// 50 ms settle consumes no reset window, then
+		// re-assert reset in flight before releasing the
+		// reads: the release waits until the same
+		// IsBeingReset probe the reads sample with is true,
+		// so every run's 100-read burst starts inside the
+		// engaged window.
+		go func() {
+			outcome = fileStatusDoReset(vfs, target)
+			close(resetDone)
+		}()
+		gated := false
+		resetFinishedEarly := false
+		gateDeadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(gateDeadline) {
+			if item := vfs.cache.Item(target); item != nil && item.IsBeingReset() {
+				gated = true
+				break
+			}
+			select {
+			case <-resetDone:
+				resetFinishedEarly = true
+			default:
+			}
+			if resetFinishedEarly {
+				break
+			}
+			runtime.Gosched()
+		}
+		if resetFinishedEarly {
+			<-resetDone
+			require.True(t, gated,
+				"run %d: reset finished before the release (result=%v): no reset window existed to span", run, outcome.result)
+		}
+		require.True(t, gated,
+			"run %d: reset never observed in flight within 30s: the reads would run against an idle file", run)
 		windowStart := time.Now()
 		cpuStart, cpuErr := fileStatusProcessCPUNS()
 		require.NoError(t, cpuErr, "run %d reading the process CPU clock", run)
 		close(release)
 		wg.Wait()
-		resetDone.Wait()
+		<-resetDone
 		for i, err := range errs {
 			require.NoError(t, err, "run %d measured read %d", run, i)
 		}
@@ -1060,9 +1095,25 @@ func TestFileStatusPerfConcurrentOracleUnderLoad(t *testing.T) {
 	proof, _ := fileStatusStartTransfer(t, vfs, transferPath, payload)
 
 	// Reset loop, churning the file being asked about
-	// for the whole oracle, with a sampler watching for
-	// the file under reset.
+	// for the whole oracle. The oracle is gated on the file
+	// being observed under reset — the same IsBeingReset
+	// probe each read samples with — so the 16 sub-ms reads
+	// run inside a reset window instead of in a repopulate
+	// gap, and every read samples IsBeingReset the way the
+	// latency run does, so each read contributes an overlap
+	// sample beside the 100µs tick sampler.
 	loop := fileStatusStartResetLoop(vfs, target)
+	gateDeadline := time.Now().Add(30 * time.Second)
+	gated := false
+	for time.Now().Before(gateDeadline) {
+		if item := vfs.cache.Item(target); item != nil && item.IsBeingReset() {
+			gated = true
+			break
+		}
+		runtime.Gosched()
+	}
+	require.True(t, gated,
+		"reset loop never held %q under reset within 30s: the reads would run against an idle file", target)
 	sampleStop := make(chan struct{})
 	sampled := fileStatusSampleBeingReset(vfs, target, 100*time.Microsecond, sampleStop)
 
@@ -1074,11 +1125,15 @@ func TestFileStatusPerfConcurrentOracleUnderLoad(t *testing.T) {
 	}
 	results := make([]rc.Params, fileStatusOracleCalls)
 	errs := make([]error, fileStatusOracleCalls)
+	sawReset := make([]bool, fileStatusOracleCalls)
 	var wg sync.WaitGroup
 	wg.Add(fileStatusOracleCalls)
 	for i := 0; i < fileStatusOracleCalls; i++ {
 		go func(i int, in rc.Params) {
 			defer wg.Done()
+			if item := vfs.cache.Item(target); item != nil && item.IsBeingReset() {
+				sawReset[i] = true
+			}
 			results[i], errs[i] = call.Fn(context.Background(), in)
 		}(i, in)
 	}
@@ -1086,6 +1141,12 @@ func TestFileStatusPerfConcurrentOracleUnderLoad(t *testing.T) {
 	windowEnd := time.Now()
 	close(sampleStop)
 	attempts, engaged, loopErrs := loop.fileStatusStop()
+	perReadSampled := 0
+	for _, v := range sawReset {
+		if v {
+			perReadSampled++
+		}
+	}
 	for i, err := range errs {
 		require.NoError(t, err, "concurrent request %d", i)
 	}
@@ -1093,13 +1154,15 @@ func TestFileStatusPerfConcurrentOracleUnderLoad(t *testing.T) {
 		fileStatusAssertPerPathResults(t, out, []string{hostTarget})
 	}
 	// Load proofs: the transfer wrote inside the window
-	// and at least one reset engaged while reads ran.
-	t.Logf("oracle under load: %d reads, reset attempts=%d engaged=%d repopulate-errors=%d sampled-under-reset=%d",
-		fileStatusOracleCalls, attempts, engaged, loopErrs, sampled.Load())
+	// and at least one reset engaged while reads ran; the
+	// per-read IsBeingReset samples prove reads observed it,
+	// the tick sampler is secondary evidence beside them.
+	t.Logf("oracle under load: %d reads, reset attempts=%d engaged=%d repopulate-errors=%d per-read-sampled-under-reset=%d tick-sampled-under-reset=%d",
+		fileStatusOracleCalls, attempts, engaged, loopErrs, perReadSampled, sampled.Load())
 	require.GreaterOrEqual(t, engaged, int64(1),
 		"no reset engaged during the oracle (%d attempts): the reads ran against an idle file", attempts)
-	assert.GreaterOrEqual(t, sampled.Load(), int64(1),
-		"the file was never observed under reset while the %d reads ran", fileStatusOracleCalls)
+	assert.GreaterOrEqual(t, int64(perReadSampled), int64(1),
+		"the file was never observed under reset while the %d reads ran (tick-sampled=%d)", fileStatusOracleCalls, sampled.Load())
 	if !proof.chunkDuring(windowStart, windowEnd) {
 		require.True(t, proof.waitForChunkAfter(windowStart, 10*time.Second),
 			"no transfer chunk inside the oracle window and none followed: the transfer was not in flight")

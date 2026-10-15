@@ -843,11 +843,17 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	}
 
 	// Decision order level 2: Identifier resolution
-	// Get the fs parameter if provided
-	fsString, err := in.GetString("fs")
-	hasFsParam := err == nil
-	if err != nil && !rc.IsErrParamNotFound(err) {
-		return nil, err
+	// A non-string fs value is malformed and takes the typed
+	// param_invalid contract error, not the generic rc envelope.
+	var fsString string
+	var hasFsParam bool
+	if rawFs, ok := in["fs"]; ok {
+		s, ok := rawFs.(string)
+		if !ok {
+			return nil, rc.NewFileStatusError("param_invalid", fmt.Sprintf("invalid value for %q: expecting string", "fs"), 400)
+		}
+		fsString = s
+		hasFsParam = true
 	}
 
 	var vfsInstance *VFS

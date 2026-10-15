@@ -33,6 +33,14 @@ var mountPointsMu sync.Mutex
 // here, so it will not appear in the map.
 var mountPoints = map[string]string{}
 
+// mountAliases preserves every additional live host path served by one
+// VFS instance (deduplicated/shared-config mounts). The first
+// registered path stays the primary (VFS.MountPoint and the single
+// vfs/list string per reported name); further paths are aliases kept
+// for identifier-less resolution and dropped one per Unregister.
+// Protected by mountPointsMu.
+var mountAliases = map[*VFS][]string{}
+
 // RegisterMountPoint registers a mount point for a VFS. The name
 // must be one of the names returned by activeCacheEntries (the
 // indexed form, e.g. "mydrive" or "mydrive[1]").
@@ -73,7 +81,10 @@ func GetAllMountPoints() map[string]string {
 //
 // It uses sequential critical sections (activeMu then mountPointsMu,
 // never nested) so vfs/list, path resolution and teardown share one
-// lock order per Constitution I.
+// lock order per Constitution I. A second live path on the same VFS
+// instance (deduplicated mount) is preserved as an alias: the first
+// path stays the primary single vfs/list string while every live
+// path still resolves.
 func RegisterMountPointForVFS(vfs *VFS, mountPoint string) {
 	activeMu.Lock()
 	configName := fs.ConfigString(vfs.f)
@@ -86,12 +97,17 @@ func RegisterMountPointForVFS(vfs *VFS, mountPoint string) {
 		}
 	}
 	var name string
+	isAlias := false
 	if index >= 0 {
-		name = configName
-		if len(vfses) > 1 {
-			name = fmt.Sprintf("%s[%d]", configName, index)
+		if vfs.MountPoint != "" && vfs.MountPoint != mountPoint {
+			isAlias = true
+		} else {
+			name = configName
+			if len(vfses) > 1 {
+				name = fmt.Sprintf("%s[%d]", configName, index)
+			}
+			vfs.MountPoint = mountPoint
 		}
-		vfs.MountPoint = mountPoint
 	}
 	activeMu.Unlock()
 	if index < 0 {
@@ -99,17 +115,43 @@ func RegisterMountPointForVFS(vfs *VFS, mountPoint string) {
 		return
 	}
 	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	if isAlias {
+		for _, existing := range mountAliases[vfs] {
+			if existing == mountPoint {
+				return
+			}
+		}
+		mountAliases[vfs] = append(mountAliases[vfs], mountPoint)
+		fs.Debugf(vfs.f, "RegisterMountPointForVFS: preserved alias mount point, primary retained")
+		return
+	}
 	mountPoints[name] = mountPoint
-	mountPointsMu.Unlock()
 }
 
 // UnregisterMountPointForVFS finds the VFS in the active cache and
 // unregisters its mount point using the correct indexed name.
 //
-// It uses sequential critical sections (activeMu then mountPointsMu,
-// never nested) so vfs/list, path resolution and teardown share one
-// lock order per Constitution I.
+// It uses sequential critical sections (mountPointsMu alias pop, then
+// activeMu, then mountPointsMu, never nested) so vfs/list, path
+// resolution and teardown share one lock order per Constitution I.
+// Unregistering one reference of a shared VFS drops one alias and
+// keeps the first live path; only the last unregister clears the
+// primary.
 func UnregisterMountPointForVFS(vfs *VFS) {
+	mountPointsMu.Lock()
+	if aliases := mountAliases[vfs]; len(aliases) > 0 {
+		aliases = aliases[:len(aliases)-1]
+		if len(aliases) == 0 {
+			delete(mountAliases, vfs)
+		} else {
+			mountAliases[vfs] = aliases
+		}
+		mountPointsMu.Unlock()
+		fs.Debugf(vfs.f, "UnregisterMountPointForVFS: dropped one alias mount point, primary retained")
+		return
+	}
+	mountPointsMu.Unlock()
 	activeMu.Lock()
 	configName := fs.ConfigString(vfs.f)
 	vfses := active[configName]
@@ -811,48 +853,42 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	var vfsName string
 
 	if hasFsParam {
-		// Identifier provided - resolve it and Hold the selected VFS
-		// while holding activeMu so unmount cannot tear it down
+		// Identifier provided - resolve the bare or indexed name
+		// emitted by vfs/list and Hold the selected VFS while
+		// holding activeMu so unmount cannot tear it down
 		// mid-request. The Held reference is released with Shutdown
-		// after the per-path results are assembled.
-		fsString = cache.Canonicalize(fsString)
+		// after the per-path results are assembled. A VFS without
+		// a mount point is never given a synthesized host point;
+		// its host paths are rejected per-path as outside_any_mount.
+		baseName, index := parseIndexedName(fsString)
+		baseName = cache.Canonicalize(baseName)
 		activeMu.Lock()
-		activeVFS := active[fsString]
+		vfses := active[baseName]
 		var selected *VFS
-		if len(activeVFS) == 1 {
-			selected = activeVFS[0]
-			if !selected.Hold() {
-				selected = nil
+		var resolvedName string
+		if index >= 0 {
+			if index < len(vfses) {
+				selected = vfses[index]
+				resolvedName = fmt.Sprintf("%s[%d]", baseName, index)
 			}
+		} else if len(vfses) == 1 {
+			selected = vfses[0]
+			resolvedName = baseName
+		}
+		if selected != nil && !selected.Hold() {
+			selected = nil
 		}
 		activeMu.Unlock()
 
-		if len(activeVFS) == 0 {
-			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("no VFS found with name %q", fsString), 400)
-		} else if len(activeVFS) > 1 {
-			// Check if fsString contains an index suffix like "name[1]"
-			// For now, if multiple VFSes with same name and no index, it's ambiguous
-			// But the indexed name should have been provided
-			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("more than one VFS active with name %q", fsString), 400)
-		}
 		if selected == nil {
-			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("no VFS found with name %q", fsString), 400)
+			if index >= 0 || len(vfses) == 0 {
+				return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("no VFS found with name %q", fsString), 400)
+			}
+			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("more than one VFS active with name %q", fsString), 400)
 		}
 		vfsInstance = selected
 		defer vfsInstance.Shutdown()
-		vfsName = fsString
-
-		// A VFS without an explicit mount point uses its remote's root
-		// as the implicit mount point (for in-process/RC/serve VFSes
-		// created without a mount point). This allows the endpoint to
-		// serve path-based queries against the remote's root.
-		if vfsInstance.MountPoint == "" {
-			root, err := vfsInstance.Root()
-			if err != nil {
-				return nil, rc.NewFileStatusError("unaccountable_path", fmt.Sprintf("cannot access VFS root: %v", err), 400)
-			}
-			vfsInstance.MountPoint = root.Path()
-		}
+		vfsName = resolvedName
 	} else {
 		// No identifier provided
 		if len(paths) > 1 {
@@ -891,29 +927,53 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 }
 
 // resolveVFSForPath finds the VFS that owns the given path by checking
-// registered mount points. It Holds the selected VFS before returning;
+// every live mount point, including alias paths preserved for
+// deduplicated mounts. It Holds the selected VFS before returning;
 // the caller must call Shutdown to release it. Returns the VFS and its
 // indexed name, or nil if the path is not inside any registered mount
 // point.
 //
-// It uses sequential snapshots (mountPointsMu copy, then activeMu
+// It uses sequential snapshots (mountPointsMu copies, then activeMu
 // selection with Hold, never nested) so vfs/list and teardown share
 // one lock order and unmount cannot tear the selection down
 // mid-request per Constitution I.
 func resolveVFSForPath(path string) (*VFS, string) {
 	mountPointsMu.Lock()
-	snapshot := make(map[string]string, len(mountPoints))
+	displaySnapshot := make(map[string]string, len(mountPoints))
 	for k, v := range mountPoints {
-		snapshot[k] = v
+		displaySnapshot[k] = v
+	}
+	aliasSnapshot := make(map[*VFS][]string, len(mountAliases))
+	for vfs, points := range mountAliases {
+		copied := make([]string, len(points))
+		copy(copied, points)
+		aliasSnapshot[vfs] = copied
 	}
 	mountPointsMu.Unlock()
 
-	// Find the longest matching mount point
+	cleanPath := filepath.Clean(path)
+	// Collect every live candidate: display points resolve through
+	// their indexed names, aliases carry their VFS directly.
+	type candidate struct {
+		vfs  *VFS
+		name string
+	}
+	var aliasCandidates []candidate
+	for vfs, points := range aliasSnapshot {
+		for _, point := range points {
+			if point == "" {
+				continue
+			}
+			if isPathInsideMountPoint(cleanPath, filepath.Clean(point)) {
+				aliasCandidates = append(aliasCandidates, candidate{vfs: vfs})
+			}
+		}
+	}
+	// Find the longest matching display mount point
 	var bestMatch string
 	var bestName string
 
-	cleanPath := filepath.Clean(path)
-	for name, mountPoint := range snapshot {
+	for name, mountPoint := range displaySnapshot {
 		if mountPoint == "" {
 			continue
 		}
@@ -929,13 +989,49 @@ func resolveVFSForPath(path string) (*VFS, string) {
 		}
 	}
 
-	if bestName == "" {
-		return nil, ""
-	}
-
 	// Select and Hold the VFS while holding activeMu only.
 	activeMu.Lock()
 	defer activeMu.Unlock()
+
+	// Aliases first: each carries its VFS, verified live under activeMu.
+	for _, c := range aliasCandidates {
+		stillLive := false
+		for _, vfses := range active {
+			for _, activeVFS := range vfses {
+				if activeVFS == c.vfs {
+					stillLive = true
+					break
+				}
+			}
+			if stillLive {
+				break
+			}
+		}
+		if !stillLive {
+			continue
+		}
+		if !c.vfs.Hold() {
+			continue
+		}
+		// Report the alias under its primary indexed name so the
+		// caller pairs it by name per FR-014.
+		configName := fs.ConfigString(c.vfs.f)
+		vfses := active[configName]
+		resolvedName := configName
+		for i, activeVFS := range vfses {
+			if activeVFS == c.vfs {
+				if len(vfses) > 1 {
+					resolvedName = fmt.Sprintf("%s[%d]", configName, i)
+				}
+				break
+			}
+		}
+		return c.vfs, resolvedName
+	}
+
+	if bestName == "" {
+		return nil, ""
+	}
 
 	// Parse the name to get config name and index
 	configName, index := parseIndexedName(bestName)
@@ -988,30 +1084,15 @@ func isPathInsideMountPoint(path, mountPoint string) bool {
 }
 
 // classifyPath classifies a single path against a VFS and returns the result object.
-// If hasFsParam is true, the caller provided an "fs" identifier, so we use the
-// VFS's remote root as the effective mount point when no explicit mount point exists.
+// A VFS without a mount point never answers a host path: no point is
+// synthesized for null-mount VFSes, so every host path is
+// outside_any_mount per FR-009/FR-014.
 func classifyPath(vfsInstance *VFS, vfsName, path string, hasFsParam bool) map[string]any {
-	// Determine the effective mount point
+	// Determine the effective mount point from the Held selection.
+	// Never synthesize a point for a VFS whose mount point is null.
 	mountPoint := vfsInstance.MountPoint
-	if mountPoint == "" && hasFsParam {
-		// VFS has no explicit mount point but we have an fs
-		// identifier - use the remote's root as the implicit
-		// mount point (for in-process/RC/serve VFSes created
-		// without a mount point). This allows the endpoint to
-		// serve path-based queries against the remote's root.
-		root, err := vfsInstance.Root()
-		if err != nil {
-			return buildErrorResult(path, "unaccountable_path", fmt.Sprintf("cannot access VFS root: %v", err))
-		}
-		mountPoint = root.Path()
-		if mountPoint == "" {
-			// Root directory of remote has empty path - treat as "/"
-			mountPoint = "/"
-		}
-	}
 
 	if mountPoint == "" {
-		// VFS has no mount point and no fs identifier - path is outside
 		return buildErrorResult(path, "outside_any_mount", "VFS has no mount point")
 	}
 
@@ -1135,18 +1216,38 @@ func cachedChild(d *Dir, leaf string) (Node, bool) {
 	return node, ok
 }
 
-// isPathInMultipleMountPoints checks if a path is inside more than one registered mount point.
+// isPathInMultipleMountPoints checks if a path is inside more than one live mount point,
+// including alias paths preserved for deduplicated mounts.
 func isPathInMultipleMountPoints(path string) bool {
 	mountPointsMu.Lock()
-	defer mountPointsMu.Unlock()
+	displaySnapshot := make([]string, 0, len(mountPoints))
+	for _, mountPoint := range mountPoints {
+		displaySnapshot = append(displaySnapshot, mountPoint)
+	}
+	var aliasSnapshot []string
+	for _, points := range mountAliases {
+		aliasSnapshot = append(aliasSnapshot, points...)
+	}
+	mountPointsMu.Unlock()
 
 	count := 0
-	for _, mountPoint := range mountPoints {
+	for _, mountPoint := range displaySnapshot {
 		if mountPoint == "" {
 			continue
 		}
 		cleanMP := filepath.Clean(mountPoint)
 		if isPathInsideMountPoint(path, cleanMP) {
+			count++
+			if count > 1 {
+				return true
+			}
+		}
+	}
+	for _, mountPoint := range aliasSnapshot {
+		if mountPoint == "" {
+			continue
+		}
+		if isPathInsideMountPoint(path, filepath.Clean(mountPoint)) {
 			count++
 			if count > 1 {
 				return true

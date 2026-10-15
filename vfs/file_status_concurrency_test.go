@@ -14,11 +14,26 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/lib/israce"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const fileStatusConcurrencyChildEnv = "RCLONE_FILE_STATUS_CONCURRENCY_CHILD"
+
+// fileStatusConcurrencyTimeout scales the fixed timeouts for the
+// concurrent list/resolve/unmount workload when running under the race
+// detector (FR-009/FR-014). The workload progresses under -race but takes
+// roughly 8x longer: measured ~1.6s non-race vs 12-14s race, so the 15s
+// budget that is comfortable without race sat right at the race runtime and
+// intermittently tripped the outer context deadline. Scaling by the measured
+// slowdown keeps the same safety margin; non-race behavior is unchanged.
+func fileStatusConcurrencyTimeout(base time.Duration) time.Duration {
+	if israce.Enabled {
+		return base * 8
+	}
+	return base
+}
 
 func TestFileStatusConcurrentListResolveUnmount(t *testing.T) {
 	if os.Getenv(fileStatusConcurrencyChildEnv) == "1" {
@@ -26,7 +41,7 @@ func TestFileStatusConcurrentListResolveUnmount(t *testing.T) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fileStatusConcurrencyTimeout(15*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFileStatusConcurrentListResolveUnmount$")
 	cmd.Env = append(os.Environ(), fileStatusConcurrencyChildEnv+"=1")
@@ -141,7 +156,7 @@ func testFileStatusConcurrentListResolveUnmount(t *testing.T) {
 		select {
 		case err := <-results:
 			assert.NoError(t, err)
-		case <-time.After(15 * time.Second):
+		case <-time.After(fileStatusConcurrencyTimeout(15 * time.Second)):
 			t.Fatal("concurrent vfs/list, path status, and unmount did not finish")
 		}
 	}

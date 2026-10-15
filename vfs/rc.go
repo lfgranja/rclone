@@ -70,46 +70,73 @@ func GetAllMountPoints() map[string]string {
 
 // RegisterMountPointForVFS finds the VFS in the active cache and
 // registers its mount point using the correct indexed name.
+//
+// It uses sequential critical sections (activeMu then mountPointsMu,
+// never nested) so vfs/list, path resolution and teardown share one
+// lock order per Constitution I.
 func RegisterMountPointForVFS(vfs *VFS, mountPoint string) {
 	activeMu.Lock()
-	defer activeMu.Unlock()
 	configName := fs.ConfigString(vfs.f)
 	vfses := active[configName]
+	index := -1
 	for i, activeVFS := range vfses {
 		if activeVFS == vfs {
-			name := configName
-			if len(vfses) > 1 {
-				name = fmt.Sprintf("%s[%d]", configName, i)
-			}
-			mountPointsMu.Lock()
-			mountPoints[name] = mountPoint
-			mountPointsMu.Unlock()
-			vfs.MountPoint = mountPoint
-			return
+			index = i
+			break
 		}
 	}
+	var name string
+	if index >= 0 {
+		name = configName
+		if len(vfses) > 1 {
+			name = fmt.Sprintf("%s[%d]", configName, index)
+		}
+		vfs.MountPoint = mountPoint
+	}
+	activeMu.Unlock()
+	if index < 0 {
+		fs.Debugf(vfs.f, "RegisterMountPointForVFS: VFS not in active cache, ignoring registration")
+		return
+	}
+	mountPointsMu.Lock()
+	mountPoints[name] = mountPoint
+	mountPointsMu.Unlock()
 }
 
 // UnregisterMountPointForVFS finds the VFS in the active cache and
 // unregisters its mount point using the correct indexed name.
+//
+// It uses sequential critical sections (activeMu then mountPointsMu,
+// never nested) so vfs/list, path resolution and teardown share one
+// lock order per Constitution I.
 func UnregisterMountPointForVFS(vfs *VFS) {
 	activeMu.Lock()
-	defer activeMu.Unlock()
 	configName := fs.ConfigString(vfs.f)
 	vfses := active[configName]
+	index := -1
 	for i, activeVFS := range vfses {
 		if activeVFS == vfs {
-			name := configName
-			if len(vfses) > 1 {
-				name = fmt.Sprintf("%s[%d]", configName, i)
-			}
-			mountPointsMu.Lock()
-			delete(mountPoints, name)
-			mountPointsMu.Unlock()
-			vfs.MountPoint = ""
-			return
+			index = i
+			break
 		}
 	}
+	var name string
+	if index >= 0 {
+		name = configName
+		if len(vfses) > 1 {
+			name = fmt.Sprintf("%s[%d]", configName, index)
+		}
+		vfs.MountPoint = ""
+	} else {
+		vfs.MountPoint = ""
+		activeMu.Unlock()
+		fs.Debugf(vfs.f, "UnregisterMountPointForVFS: VFS not in active cache, cleared mount point field")
+		return
+	}
+	activeMu.Unlock()
+	mountPointsMu.Lock()
+	delete(mountPoints, name)
+	mountPointsMu.Unlock()
 }
 
 // GetVFS gets a VFS with config name "fs" from the cache or returns an error.
@@ -492,27 +519,40 @@ mount point path, or null for a VFS created without a mount point
 }
 
 func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	// Single critical section on activeMu only: copy the active VFS
+	// pointers and their mount points, then build the report without
+	// holding any lock. This removes the activeMu->mountPointsMu
+	// nesting (the inversion resolveVFSForPath held the opposite
+	// order) while keeping the vfses shape unchanged per FR-014.
+	type vfsEntry struct {
+		mountPoint string
+	}
+	snapshot := make(map[string][]vfsEntry, len(active))
 	activeMu.Lock()
-	defer activeMu.Unlock()
+	for name, vfses := range active {
+		entries := make([]vfsEntry, 0, len(vfses))
+		for _, v := range vfses {
+			entries = append(entries, vfsEntry{mountPoint: v.MountPoint})
+		}
+		snapshot[name] = entries
+	}
+	activeMu.Unlock()
 	var names = []string{}
 	mountPointsMap := make(map[string]any)
-	for name, vfses := range active {
-		if len(vfses) == 1 {
+	for name, entries := range snapshot {
+		if len(entries) == 1 {
 			names = append(names, name)
-			// Check if this VFS has a mount point
-			mountPoint := GetMountPoint(name)
-			if mountPoint != "" {
-				mountPointsMap[name] = mountPoint
+			if entries[0].mountPoint != "" {
+				mountPointsMap[name] = entries[0].mountPoint
 			} else {
 				mountPointsMap[name] = nil
 			}
 		} else {
-			for i := range vfses {
+			for i, e := range entries {
 				indexedName := fmt.Sprintf("%s[%d]", name, i)
 				names = append(names, indexedName)
-				mountPoint := GetMountPoint(indexedName)
-				if mountPoint != "" {
-					mountPointsMap[indexedName] = mountPoint
+				if e.mountPoint != "" {
+					mountPointsMap[indexedName] = e.mountPoint
 				} else {
 					mountPointsMap[indexedName] = nil
 				}
@@ -771,10 +811,20 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	var vfsName string
 
 	if hasFsParam {
-		// Identifier provided - resolve it
-		activeMu.Lock()
+		// Identifier provided - resolve it and Hold the selected VFS
+		// while holding activeMu so unmount cannot tear it down
+		// mid-request. The Held reference is released with Shutdown
+		// after the per-path results are assembled.
 		fsString = cache.Canonicalize(fsString)
+		activeMu.Lock()
 		activeVFS := active[fsString]
+		var selected *VFS
+		if len(activeVFS) == 1 {
+			selected = activeVFS[0]
+			if !selected.Hold() {
+				selected = nil
+			}
+		}
 		activeMu.Unlock()
 
 		if len(activeVFS) == 0 {
@@ -785,7 +835,11 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 			// But the indexed name should have been provided
 			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("more than one VFS active with name %q", fsString), 400)
 		}
-		vfsInstance = activeVFS[0]
+		if selected == nil {
+			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("no VFS found with name %q", fsString), 400)
+		}
+		vfsInstance = selected
+		defer vfsInstance.Shutdown()
 		vfsName = fsString
 
 		// A VFS without an explicit mount point uses its remote's root
@@ -804,7 +858,8 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 		if len(paths) > 1 {
 			return nil, rc.NewFileStatusError("ambiguous_mount", "multiple paths provided but no fs parameter", 400)
 		}
-		// Single path - resolve against mount points.
+		// Single path - resolve against mount points. The resolver
+		// Holds the selected VFS; release it after classification.
 		singlePath := filepath.Clean(paths[0])
 		vfsInstance, vfsName = resolveVFSForPath(singlePath)
 		if vfsInstance == nil {
@@ -817,6 +872,7 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 			out = rc.Params{"statuses": []any{result}}
 			return out, nil
 		}
+		defer vfsInstance.Shutdown()
 	}
 
 	// Now we have a single VFS to query
@@ -835,23 +891,33 @@ func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 }
 
 // resolveVFSForPath finds the VFS that owns the given path by checking
-// registered mount points. Returns the VFS and its indexed name, or nil if
-// the path is not inside any registered mount point.
+// registered mount points. It Holds the selected VFS before returning;
+// the caller must call Shutdown to release it. Returns the VFS and its
+// indexed name, or nil if the path is not inside any registered mount
+// point.
+//
+// It uses sequential snapshots (mountPointsMu copy, then activeMu
+// selection with Hold, never nested) so vfs/list and teardown share
+// one lock order and unmount cannot tear the selection down
+// mid-request per Constitution I.
 func resolveVFSForPath(path string) (*VFS, string) {
 	mountPointsMu.Lock()
-	defer mountPointsMu.Unlock()
+	snapshot := make(map[string]string, len(mountPoints))
+	for k, v := range mountPoints {
+		snapshot[k] = v
+	}
+	mountPointsMu.Unlock()
 
 	// Find the longest matching mount point
 	var bestMatch string
 	var bestName string
-	var bestVFS *VFS
 
-	for name, mountPoint := range mountPoints {
+	cleanPath := filepath.Clean(path)
+	for name, mountPoint := range snapshot {
 		if mountPoint == "" {
 			continue
 		}
 		cleanMP := filepath.Clean(mountPoint)
-		cleanPath := filepath.Clean(path)
 
 		// Check if path is inside this mount point
 		if isPathInsideMountPoint(cleanPath, cleanMP) {
@@ -867,17 +933,24 @@ func resolveVFSForPath(path string) (*VFS, string) {
 		return nil, ""
 	}
 
-	// Find the VFS for this name
+	// Select and Hold the VFS while holding activeMu only.
 	activeMu.Lock()
 	defer activeMu.Unlock()
 
 	// Parse the name to get config name and index
 	configName, index := parseIndexedName(bestName)
 	vfses := active[configName]
+	var bestVFS *VFS
 	if index >= 0 && index < len(vfses) {
 		bestVFS = vfses[index]
 	} else if len(vfses) == 1 && index == -1 {
 		bestVFS = vfses[0]
+	}
+	if bestVFS == nil {
+		return nil, ""
+	}
+	if !bestVFS.Hold() {
+		return nil, ""
 	}
 
 	return bestVFS, bestName

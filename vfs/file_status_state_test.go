@@ -10,13 +10,14 @@
 // reported pair to (contracts/api.md "Response Format" and
 // "State Value Definitions"; data-model.md "ByteInfo").
 //
-// The in-process VFS a test creates carries no mount point,
-// so the request names the mount by its "fs" identifier and
-// the endpoint answers for the paths under the remote's
-// root, which is the mount's host interior. The
+// The in-process VFS a test creates is mounted at the remote's
+// host root, so the request names the mount by its "fs"
+// identifier and the endpoint answers for the paths under the
+// remote's root, which is the mount's host interior. The
 // mount-point registry that identifier-less resolution goes
-// through (FR-009/FR-014, RegisterMountPointForVFS) reports null
-// for a VFS created without one.
+// through (FR-009/FR-014, RegisterMountPointForVFS) reports the
+// registered point for a VFS created this way, and null for a
+// VFS created without one.
 //
 // They exercise the implemented state derivation (vfs/file_status.go
 // fileStatusOf, T020) and the exit map of FR-027. The exit map
@@ -153,6 +154,11 @@ func newFileStatusStateRun(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *
 	}
 	r := fstest.NewRun(t)
 	vfs := New(context.Background(), r.Fremote, opt)
+	// The endpoint checks fs-identifier queries for containment
+	// against the VFS mount point (T075), rejecting a VFS with
+	// none, so the harness mounts the test remote at its host
+	// root, the way newFileStatusStateRunAtRemoteRoot does.
+	vfs.MountPoint = r.Fremote.Root()
 	t.Cleanup(func() {
 		cleanupVFS(t, vfs)
 	})

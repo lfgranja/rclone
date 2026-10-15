@@ -1341,8 +1341,9 @@ func classifyPath(vfsInstance *VFS, vfsName, mountPoint, path string, hasFsParam
 
 	// Regular file - get its status without any remote call. The size
 	// comes from the directory entry the mount already holds; a file
-	// with no cache item is not_held with that size, so no NewObject
-	// lookup is made per FR-002/FR-005.
+	// with no cache record is not_held with that size, so no NewObject
+	// lookup is made per FR-002/FR-005. The record is probed, never
+	// created, so the read changes no published cache total.
 	cachePath := relPath
 	if cachePath == "." {
 		cachePath = ""
@@ -1364,7 +1365,7 @@ func classifyPath(vfsInstance *VFS, vfsName, mountPoint, path string, hasFsParam
 			},
 			IsDir: false,
 		}
-	} else if vfsInstance.cache == nil || vfsInstance.cache.Item(cachePath) == nil {
+	} else if vfsInstance.cache == nil || statusProbeHasNoRecord(vfsInstance, cachePath) {
 		size := node.Size()
 		status = FileStatus{
 			Local:  FileLocalNotHeld,
@@ -1381,6 +1382,23 @@ func classifyPath(vfsInstance *VFS, vfsName, mountPoint, path string, hasFsParam
 		status = fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
 	}
 	return buildStatusResult(path, status, cacheOff)
+}
+
+// statusProbeHasNoRecord reports whether a status read would find no
+// cache record for cachePath. Unlike Cache.Item it never creates an
+// index entry, so a status-only probe changes no published cache total
+// (FR-005) and a phantom size-0 entry can never misread as fully_held.
+// A synthesized metadata file has no record by design; it is not
+// reported missing here so fileStatusOf still answers it from its
+// readable in-memory node.
+//
+// The caller must only call it with a non-nil cache.
+func statusProbeHasNoRecord(vfsInstance *VFS, cachePath string) bool {
+	if _, found := vfsInstance.cache.ProbeSnapshot(cachePath); found {
+		return false
+	}
+	_, isMeta := vfsInstance.isMetadataFile(cachePath)
+	return !isMeta
 }
 
 // errUnaccountable reports that the mount holds no current listing of

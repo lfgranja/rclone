@@ -108,3 +108,25 @@ and compliant with Constitution I–V.
 
 Remaining procedural steps (full suite, formal SC records, CI lint installation,
 disk-space resolution) are environmental, not functional gaps.
+
+---
+
+## Verification execution — 2026-10-15 (delegated subagents + direct shell)
+
+Delegated (background, subagent-driven per R3/R4):
+- ses_ebe14fa11ffeSrmqDZfbdp01Mj — T051-T054 command verification
+- ses_ebe14ebe8ffedzRqmBn1H4Z46q — fixture/doc/BCE gate (T032-T033-T040)
+- ses_ebe14e059ffe1pvvmqPZ0eLf0v — property/invariant verification (T066+ invariant coverage)
+
+Direct shell outputs (recorded in /tmp/verify_*.txt):
+- T053 focused (non-race): PASS — `go test ./vfs/ -run TestFileStatusDecisionOutsideAnyMount|TestFileStatusStateByteInvariantsAcrossRangePatterns -count=1` → PASS 1.383s
+- T053 property/invariant sub-cases (CacheStats, ByteInvariants): PASS (4/4); `testing/quick.Check` uses `file_status_decision_test.go:452`, `file_status_state_test.go:1907`
+- T053 -race: FAIL — `/tmp` no space (build error; env limitation per T095 / VERIFICATION.md line 24)
+- T051 quicktest: BLOCKED — `/tmp` exhaustion at compile (timeout 30s; same env limitation)
+- T054 fixtures: PASS — 7 normalized JSON files (`vfs/testdata/file_status/`)
+- T054 BCE gate: PASS — `FILE_STATUS_UPDATE_FIXTURES` at `file_status_bce_test.go:22,51`
+- T054 exit codes 11/12: PASS — `docs/content/docs.md` lines 3444-3481
+- T054 contract/code alignment: PASS — endpoint `vfs/rc.go:807`; error codes match (`empty_path`, `param_invalid`, `no_active_mount`, `ambiguous_mount`)
+- Decision-order property test: present (`TestFileStatusDecisionDeterminism` `quick.Check` at `file_status_decision_test.go:452`); `StateSnapshot` covered by `TestFileStatusObservationSnapshotUnderInterleaving` and `TestFileStatusStateSingleObservationInstant`
+
+No source-file edits required; existing implementation (vfs/rc.go rcFileStatus, file_status.go, file_status_types.go, fs/rc/file_status_error.go, fs/rc/rcserver/rcserver.go, cmd/vfs/status/status.go, mountPoints in rcList) aligns with `contracts/api.md`, `spec.md`, `data-model.md`. Verification attestation per R5: only focused tests + mechanism checks attest success; full-suite formal records pending `/tmp` resolution (T093).

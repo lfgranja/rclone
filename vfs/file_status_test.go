@@ -247,10 +247,15 @@ func TestFileStatusFsIdentifierResolution(t *testing.T) {
 	})
 }
 
-// TestFileStatusNoActiveMount pins that a request reaching a server
-// with no mount active at all is the whole-request no_active_mount
-// failure, whatever its paths. The active VFS cache is process-wide
-// state that earlier tests in this package populate, so the request is
+// TestFileStatusNoActiveMount pins the empty-server corner of the
+// identifier-resolution level of FR-006 (contracts/api.md:339-342): a
+// request carrying no identifier and naming exactly one path resolves
+// that path against the registered mount points, so with no mount
+// active at all it is the per-path outside_any_mount result answered
+// 200, never the whole-request no_active_mount failure; no_active_mount
+// requires an identifier matching no running mount, pinned here with an
+// unmatched fs identifier. The active VFS cache is process-wide state
+// that earlier tests in this package populate, so both requests are
 // made in a re-executed child process in which no test has created a
 // VFS yet.
 func TestFileStatusNoActiveMount(t *testing.T) {
@@ -265,24 +270,22 @@ func TestFileStatusNoActiveMount(t *testing.T) {
 		if call == nil {
 			t.Fatal("vfs/file-status is not registered")
 		}
+		// A request carrying no identifier never takes
+		// no_active_mount: the single path resolves against the mount
+		// points, and with no mount active it is outside every mount
+		// (mirrors TestFileStatusDecisionOutsideAnyMount
+		// single-path-with-no-mount-active).
 		in := rc.Params{"paths": []string{"/file.txt"}}
 		out, err := call.Fn(context.Background(), in)
-		if err == nil {
-			t.Fatalf("expected the whole-request no_active_mount failure, got a response: %v", out)
-		}
-		var fileStatusErr *rc.FileStatusError
-		if !errors.As(err, &fileStatusErr) {
-			t.Fatalf("expected a *rc.FileStatusError, got %T: %v", err, err)
-		}
-		if fileStatusErr.Code != "no_active_mount" {
-			t.Fatalf("expected code no_active_mount, got %q", fileStatusErr.Code)
-		}
-		if fileStatusErr.Status != http.StatusBadRequest {
-			t.Fatalf("expected status %d, got %d", http.StatusBadRequest, fileStatusErr.Status)
-		}
-		if out != nil {
-			t.Fatalf("expected no response, got %v", out)
-		}
+		require.NoError(t, err)
+		requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
+		// An identifier matching no running mount is the whole-request
+		// no_active_mount failure.
+		inUnmatched := rc.Params{"fs": "no-such-mount", "paths": []string{"/file.txt"}}
+		outUnmatched, errUnmatched := call.Fn(context.Background(), inUnmatched)
+		require.Error(t, errUnmatched)
+		requireWholeRequestRejection(t, errUnmatched, "no_active_mount")
+		assert.Nil(t, outUnmatched)
 		return
 	}
 

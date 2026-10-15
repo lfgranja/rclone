@@ -7,16 +7,17 @@ import (
 
 // fileStatusOf derives the FileStatus for a single path from the
 // mount's persisted per-file record. It is called with the VFS lock
-// not held; it takes the item's own lock for a single observation
-// instant (FR-022). It never blocks on a transfer or reset condition
-// (FR-026); if the record is mid-rewrite the local fact is reported
-// as underivable. The two facts are derived independently from the
-// same record snapshot — the 36 pairs of FR-022 have no cross-fact
-// coupling. The cacheOff flag is the mount-level guard for
-// not_tracked (FR-011). The isLink flag indicates the final path
-// component is a symlink on a mount started to show links; the local
-// fact becomes not_regular_file with all three byte quantities
-// not_measurable (FR-032).
+// not held. The record is probed — never created — so a status-only
+// read changes no published cache total (FR-005); it takes the item's
+// own snapshot for a single observation instant (FR-022) and never
+// blocks on a transfer or reset condition (FR-026): a record a reset
+// is mid-rewrite on is reported as underivable. The two facts are
+// derived independently from the same snapshot — the 36 pairs of
+// FR-022 have no cross-fact coupling. The cacheOff flag is the
+// mount-level guard for not_tracked (FR-011). The isLink flag
+// indicates the final path component is a symlink on a mount started
+// to show links; the local fact becomes not_regular_file with all
+// three byte quantities not_measurable (FR-032).
 func fileStatusOf(v *VFS, cachePath string, isLink, cacheOff bool) FileStatus {
 	// Non-regular file: mount started to show links, final component
 	// is a symlink. The local fact is not_regular_file with all three
@@ -65,14 +66,18 @@ func fileStatusOf(v *VFS, cachePath string, isLink, cacheOff bool) FileStatus {
 		}
 	}
 
-	// Cache-keeping mount: look up the item in the cache. The item
-	// may not exist (file never accessed through the mount), or it
-	// may exist with various states.
-	item := v.cache.Item(cachePath)
-	if item == nil {
-		// No cache entry at all. The mount holds no copy of the
-		// file — local fact not_held, 0 held bytes (true zero,
-		// FR-002), total_size from the remote object if available.
+	// Cache-keeping mount: probe the file's record. The probe brings
+	// no entry into the cache index, so the published cache totals
+	// are unchanged by the read; where the persisted record survives
+	// on disk it is still accounted for (FR-030/FR-031).
+	snap, ok := v.cache.ProbeSnapshot(cachePath)
+	if !ok {
+		// No record at all. A synthesized metadata file is reported
+		// from its readable in-memory node rather than from the
+		// absent item; anything else holds no copy of the file.
+		if status, found := fileStatusMetadata(v, cachePath); found {
+			return status
+		}
 		size := int64(-1)
 		if o, err := v.f.NewObject(v.ctx, cachePath); err == nil && o != nil {
 			size = o.Size()
@@ -90,95 +95,98 @@ func fileStatusOf(v *VFS, cachePath string, isLink, cacheOff bool) FileStatus {
 		}
 	}
 
-	// Item exists: check if it's being reset. Per FR-026 the read
-	// does not wait for the reset; the local fact is underivable.
-	if item.IsBeingReset() {
-		return fileStatusFromItem(item, cachePath, true, v)
+	// A reset is rewriting the record. Per FR-026 the read does not
+	// wait for it; the local fact is underivable with both held
+	// quantities not_determinable, and total_size not_determinable
+	// since it cannot be derived without waiting either. The upload
+	// fact keeps the mount-level value for a file whose upload cannot
+	// be observed mid-reset.
+	if snap.Resetting {
+		return FileStatus{
+			Local:  FileLocalUnderivable,
+			Upload: FileUploadNotApplicable,
+			Bytes: FileByteInfo{
+				TotalKnown: false,
+			},
+			IsDir: false,
+		}
 	}
 
-	// Normal case: derive both facts from the item's current record.
-	return fileStatusFromItem(item, cachePath, false, v)
+	// Normal case: derive both facts from the single snapshot.
+	return fileStatusFromSnapshot(v, snap)
 }
 
-// fileStatusFromItem derives the FileStatus from an item's record
-// snapshot. The underivable flag forces the local fact to
-// underivable with both held quantities not_determinable (used when
-// beingReset is true, FR-026).
-func fileStatusFromItem(item *vfscache.Item, cachePath string, underivable bool, v *VFS) FileStatus {
-	// Get a consistent snapshot of the item's persisted info.
-	rs := item.GetRanges()
-	size := item.GetSizeLocked()
-	dirty := item.IsDirty()
-	writeBackID := item.GetWriteBackID()
-	fingerprint := item.GetFingerprint()
+// fileStatusFromSnapshot derives the FileStatus from one coherent
+// per-file observation. The local fact, the upload fact and the byte
+// quantities all come from the same snapshot, so a reported pair
+// always describes one moment (FR-022) and never tears across
+// separate reads of the record.
+func fileStatusFromSnapshot(v *VFS, snap vfscache.ItemSnapshot) FileStatus {
+	size := snap.Size
+	totalKnown := size >= 0
 
-	// Determine held bytes from the ranges.
+	// Determine held bytes from the snapshot's ranges.
 	var unbrokenRun, totalHeld int64
-	var totalKnown bool
-	if !underivable {
-		if rs != nil {
-			unbrokenRun = unbrokenRunFrom(rs, 0, size)
-			totalHeld = rs.Size()
-		}
-		if size >= 0 {
-			totalKnown = true
-		}
-	} else if size >= 0 {
-		// Underivable: both held quantities are not_determinable
-		// (rendered by ToParams). Total size is still a measurement
-		// where the mount knows it (FR-002, FR-004).
-		totalKnown = true
+	if snap.Rs != nil {
+		totalHeld = snap.Rs.Size()
+	}
+	switch {
+	case size < 0:
+		// The total is unknown: the unbroken run is the cached
+		// prefix from offset zero, whatever follows the gap being
+		// counted in the total held only (FR-002).
+		unbrokenRun = unbrokenPrefix(snap.Rs)
+	case size > 0:
+		unbrokenRun = unbrokenRunFrom(snap.Rs, 0, size)
 	}
 
 	// Local fact derivation.
 	var local FileLocalState
-	if underivable {
-		local = FileLocalUnderivable
-	} else if rs == nil || rs.Size() == 0 {
+	switch {
+	case size == 0:
+		// A file with no bytes to be present has all of its bytes
+		// present (FR-002a).
+		local = FileLocalFullyHeld
+	case snap.DownloadErr != nil && totalKnown:
+		// A failed download takes the failure value rather than
+		// partly_held, the held quantities still describing the
+		// bytes that did arrive (FR-028). It needs a known size to
+		// state the quantities against.
+		local = FileLocalDownloadFailed
+	case snap.Rs == nil || totalHeld == 0:
 		// No ranges held.
 		local = FileLocalNotHeld
-	} else if size >= 0 && rs.Present(ranges.Range{Pos: 0, Size: size}) {
+	case size >= 0 && snap.Rs.Present(ranges.Range{Pos: 0, Size: size}):
 		// Entire file present.
 		local = FileLocalFullyHeld
-	} else {
-		// Partially held.
+	default:
+		// Partially held, including a zero prefix where only later
+		// bytes are cached.
 		local = FileLocalPartlyHeld
-	}
-
-	// Check for download failure: if downloaders have accumulated
-	// errors, the download failed. The held quantities still
-	// describe the bytes that did arrive (FR-028).
-	if local != FileLocalUnderivable {
-		errCount, lastErr := item.GetDownloadersError()
-		if errCount > 0 && lastErr != nil {
-			local = FileLocalDownloadFailed
-		}
 	}
 
 	// Upload fact derivation.
 	var upload FileUploadState
-	if dirty {
-		// File has local modifications not yet uploaded.
-		if writeBackID != 0 {
-			// There is a writeback queue entry.
-			if v.cache.WritebackUploading(writeBackID) {
-				upload = FileUploadUploading
-			} else {
-				upload = FileUploadAwaitingUpload
-			}
+	switch {
+	case snap.UploadErr != nil:
+		// The last upload attempt on this mount instance failed. A
+		// retry being scheduled clears nothing; only a later
+		// successful transfer does (FR-028).
+		upload = FileUploadUploadFailed
+	case snap.Dirty:
+		// Local modifications not yet uploaded.
+		if snap.WriteBackID != 0 && v.cache.WritebackUploading(snap.WriteBackID) {
+			upload = FileUploadUploading
 		} else {
-			// Dirty but no writeback ID — upload failed on this
-			// mount instance and is not currently queued (FR-003,
-			// FR-028). The failure is reported for the life of the
-			// mount.
-			upload = FileUploadUploadFailed
+			upload = FileUploadAwaitingUpload
 		}
-	} else if fingerprint != "" {
-		// Not dirty and has fingerprint: upload completed.
+	case snap.UploadCompleted:
+		// This mount instance completed the upload of the current
+		// content. A file merely read into the cache was never
+		// written through the mount and stays not_applicable.
 		upload = FileUploadUploaded
-	} else {
-		// Not dirty, no fingerprint: never written through this
-		// mount.
+	default:
+		// Never written through this mount.
 		upload = FileUploadNotApplicable
 	}
 
@@ -193,6 +201,39 @@ func fileStatusFromItem(item *vfscache.Item, cachePath string, underivable bool,
 		},
 		IsDir: false,
 	}
+}
+
+// fileStatusMetadata reports a synthesized metadata file from its
+// readable in-memory node. Asking for the path is what brings the
+// entry into being and it holds real content once there, so it takes
+// its values on the same terms as any other path — fully held with
+// real quantities — rather than not_found or not_held. Its upload
+// fact is reported like any other path's: the mount never wrote it.
+// It reports false where the path is not a metadata file or names no
+// readable regular file.
+func fileStatusMetadata(v *VFS, cachePath string) (FileStatus, bool) {
+	if _, found := v.isMetadataFile(cachePath); !found {
+		return FileStatus{}, false
+	}
+	node, err := v.Stat(cachePath)
+	if err != nil || node == nil || !node.IsFile() {
+		return FileStatus{}, false
+	}
+	size := node.Size()
+	if size < 0 {
+		return FileStatus{}, false
+	}
+	return FileStatus{
+		Local:  FileLocalFullyHeld,
+		Upload: FileUploadNotApplicable,
+		Bytes: FileByteInfo{
+			UnbrokenRun: size,
+			TotalHeld:   size,
+			TotalSize:   size,
+			TotalKnown:  true,
+		},
+		IsDir: false,
+	}, true
 }
 
 // unbrokenRunFrom returns the length of the unbroken run of
@@ -210,4 +251,15 @@ func unbrokenRunFrom(rs ranges.Ranges, offset, size int64) int64 {
 		return 0
 	}
 	return missing.Pos - offset
+}
+
+// unbrokenPrefix returns the length of the unbroken run of present
+// bytes from offset zero where the total size is unknown: the reach
+// of the first range where it starts at zero, else 0. The ranges are
+// sorted and coalesced, so the first range is the lowest one.
+func unbrokenPrefix(rs ranges.Ranges) int64 {
+	if len(rs) == 0 || rs[0].Pos != 0 {
+		return 0
+	}
+	return rs[0].Size
 }

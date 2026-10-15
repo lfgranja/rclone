@@ -60,6 +60,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/lib/israce"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -451,18 +452,37 @@ func TestFileStatusPerfClearRefsKeepsHWM(t *testing.T) {
 	fileStatusRequireLinux(t)
 	before, err := fileStatusVMHWM()
 	require.NoError(t, err)
-	// Push the peak with a touched 48 MiB mapping, then
-	// drop it so only the mark — not the memory —
-	// remains.
-	blob := make([]byte, 48<<20)
-	for i := 0; i < len(blob); i += os.Getpagesize() {
-		blob[i] = 1
+	// Push the peak with touched mappings, then drop
+	// them so only the mark — not the memory —
+	// remains. Under the race detector the runtime
+	// maps large shadow/arena regions at startup, so
+	// the inherited HWM can already sit above
+	// before+48MiB and a fixed 48MiB touch need not
+	// move the mark (measured 103630→103630 pages):
+	// touch 48MiB slices until the mark moves,
+	// keeping every slice alive so the peak is real.
+	// Outside race the first slice is the historical
+	// 48MiB touch, unchanged.
+	const hwmTouchChunk = 48 << 20
+	const hwmTouchMaxChunks = 16
+	pageSize := os.Getpagesize()
+	var held [][]byte
+	peak := before
+	for peak <= before && len(held) < hwmTouchMaxChunks {
+		blob := make([]byte, hwmTouchChunk)
+		for i := 0; i < len(blob); i += pageSize {
+			blob[i] = 1
+		}
+		held = append(held, blob)
+		var readErr error
+		peak, readErr = fileStatusVMHWM()
+		require.NoError(t, readErr)
 	}
-	peak, err := fileStatusVMHWM()
-	require.NoError(t, err)
-	require.Greater(t, peak, before, "touching 48 MiB did not move VmHWM (%d → %d pages)", before, peak)
-	for i := range blob {
-		blob[i] = 0
+	require.Greater(t, peak, before, "touching %d MiB did not move VmHWM (%d → %d pages)", len(held)*hwmTouchChunk>>20, before, peak)
+	for _, blob := range held {
+		for i := range blob {
+			blob[i] = 0
+		}
 	}
 	runtime.GC()
 	if err := os.WriteFile("/proc/self/clear_refs", []byte("5"), 0o644); err != nil {
@@ -470,7 +490,7 @@ func TestFileStatusPerfClearRefsKeepsHWM(t *testing.T) {
 	}
 	after, err := fileStatusVMHWM()
 	require.NoError(t, err)
-	t.Logf("VmHWM: %d pages before the 48 MiB peak, %d at peak, %d after clear_refs", before, peak, after)
+	t.Logf("VmHWM: %d pages before the %d MiB peak, %d at peak, %d after clear_refs", before, len(held)*hwmTouchChunk>>20, peak, after)
 	// The mark persists: clear_refs freed nothing off the
 	// peak (a few pages of harness noise may push a new
 	// tiny peak between the reads, which is why this is
@@ -787,6 +807,34 @@ func TestFileStatusPerfCPU(t *testing.T) {
 	// size: the per-query CPU at each size is bounded by
 	// the size's multiple of the single-path per-query
 	// CPU, plus slack for the fixed per-query cost.
+	// Under the race detector the instrumented
+	// allocator/GC multiplies the per-object cost and
+	// its noise with it (pilots 61.8–80.3µs against
+	// ~21–26µs non-race), so a fixed 100µs slack
+	// cannot separate linear from superlinear: assert
+	// the scale-invariant property instead, bounding
+	// each consecutive-size ratio by the size ratio
+	// plus tolerance (measured race ratios 5.95/8 and
+	// 4.66/4, i.e. ≤1.17× the size ratio). A
+	// superlinear blowup still fails — quadratic
+	// growth reads 64×/16× here against bounds 12×/6×.
+	if israce.Enabled {
+		const cpuRaceRatioTol = 1.5
+		for i := 1; i < len(medians); i++ {
+			require.Greater(t, medians[i-1], time.Duration(0),
+				"size-%d median CPU is not positive, no ratio to bound size %d against",
+				fileStatusCPUSizes[i-1], fileStatusCPUSizes[i])
+			ratio := float64(medians[i]) / float64(medians[i-1])
+			maxRatio := float64(fileStatusCPUSizes[i]) / float64(fileStatusCPUSizes[i-1]) * cpuRaceRatioTol
+			t.Logf("CPU linearity (race): size %d→%d ratio %.3f against the %.3f bound (medians %v → %v)",
+				fileStatusCPUSizes[i-1], fileStatusCPUSizes[i], ratio, maxRatio, medians[i-1], medians[i])
+			assert.LessOrEqual(t, ratio, maxRatio,
+				"per-query CPU from response size %d (%v) to %d (%v) grows %.3fx, past the %.3fx linear-ratio bound (size ratio %.3f + tolerance)",
+				fileStatusCPUSizes[i-1], medians[i-1], fileStatusCPUSizes[i], medians[i], ratio, maxRatio,
+				float64(fileStatusCPUSizes[i])/float64(fileStatusCPUSizes[i-1]))
+		}
+		return
+	}
 	for i := 1; i < len(medians); i++ {
 		bound := time.Duration(int64(fileStatusCPUSizes[i])*medians[0].Nanoseconds()) + fileStatusCPUSlack
 		assert.LessOrEqual(t, medians[i], bound,
@@ -1131,6 +1179,34 @@ func TestFileStatusPerfWSSMRC(t *testing.T) {
 			popFirst[res.point.mountSize] = res.warmRSS
 		}
 	}
+	// Under the race detector the instrumented
+	// allocator quarantines freed blocks instead of
+	// returning them, so settled floors inflate (~28k
+	// vs ~15k pages) and every point's churn retains
+	// hundreds of pages the absolute non-race counts
+	// forbid — measured over race runs: settled
+	// growth ≤185, transient peak ≤230,
+	// within-population spread ≤1156, first-point
+	// population slope ~32–34 pages/file. Scale the
+	// page tolerances from those race-measured floors
+	// rather than the absolute counts (lib/israce
+	// reports the build's race flag; the non-race
+	// values below are the calibrated constants
+	// unchanged). A genuine leak — thousands of
+	// retained pages per point or per file — still
+	// exceeds every scaled bound.
+	wssGrowthTol := int64(fileStatusWSSGrowthPages)
+	wssPeakTol := int64(fileStatusWSSPeakPages)
+	wssSpreadTol := int64(fileStatusWSSSpreadPages)
+	wssPopSlope := int64(fileStatusWSSPopSlopePages)
+	if israce.Enabled {
+		wssGrowthTol = 320
+		wssPeakTol = 512
+		wssSpreadTol = 2048
+		wssPopSlope = 64
+		t.Logf("WSS/MRC race build: scaled tolerances growth=%d peak=%d spread=%d slope=%d pages/file",
+			wssGrowthTol, wssPeakTol, wssSpreadTol, wssPopSlope)
+	}
 	for _, res := range results {
 		// The leak signal is settled-to-settled growth:
 		// the point retains nothing past its own
@@ -1138,28 +1214,28 @@ func TestFileStatusPerfWSSMRC(t *testing.T) {
 		// floor (query-loop garbage the post-loop
 		// settle collects) is recorded and bounded
 		// separately.
-		assert.LessOrEqual(t, res.finalRSS-res.warmRSS, int64(fileStatusWSSGrowthPages),
+		assert.LessOrEqual(t, res.finalRSS-res.warmRSS, wssGrowthTol,
 			"population=%d rate=%d: settled RSS grew %d pages across the point (tolerance %d)",
-			res.point.mountSize, res.point.queryRate, res.finalRSS-res.warmRSS, fileStatusWSSGrowthPages)
-		assert.LessOrEqual(t, res.peakRSS-res.warmRSS, int64(fileStatusWSSPeakPages),
+			res.point.mountSize, res.point.queryRate, res.finalRSS-res.warmRSS, wssGrowthTol)
+		assert.LessOrEqual(t, res.peakRSS-res.warmRSS, wssPeakTol,
 			"population=%d rate=%d: transient peak %d pages above the settled floor (tolerance %d)",
-			res.point.mountSize, res.point.queryRate, res.peakRSS-res.warmRSS, fileStatusWSSPeakPages)
+			res.point.mountSize, res.point.queryRate, res.peakRSS-res.warmRSS, wssPeakTol)
 		// ... the query-rate axis stays within tolerance
 		// of the population's own first point (a point
 		// settling below it is shrinkage, not growth) ...
-		assert.LessOrEqual(t, res.warmRSS, popFirst[res.point.mountSize]+int64(fileStatusWSSSpreadPages),
+		assert.LessOrEqual(t, res.warmRSS, popFirst[res.point.mountSize]+wssSpreadTol,
 			"population=%d rate=%d: post-warm RSS %d pages exceeds the population's first point %d by more than the %d-page tolerance",
-			res.point.mountSize, res.point.queryRate, res.warmRSS, popFirst[res.point.mountSize], fileStatusWSSSpreadPages)
+			res.point.mountSize, res.point.queryRate, res.warmRSS, popFirst[res.point.mountSize], wssSpreadTol)
 		// ... and the population axis grows at most
 		// linearly with the characterized live-state
 		// slope from the first point.
 		popBound := first.warmRSS +
-			int64(fileStatusWSSPopSlopePages*(res.point.mountSize-first.point.mountSize)) +
-			int64(fileStatusWSSSpreadPages)
+			wssPopSlope*int64(res.point.mountSize-first.point.mountSize) +
+			wssSpreadTol
 		assert.LessOrEqual(t, res.warmRSS, popBound,
 			"population=%d rate=%d: post-warm RSS %d pages exceeds the linear population bound %d (first %d + %d pages/file × %d files + tolerance %d)",
 			res.point.mountSize, res.point.queryRate, res.warmRSS, popBound,
-			first.warmRSS, fileStatusWSSPopSlopePages, res.point.mountSize-first.point.mountSize, fileStatusWSSSpreadPages)
+			first.warmRSS, wssPopSlope, res.point.mountSize-first.point.mountSize, wssSpreadTol)
 		assert.LessOrEqual(t, res.avgDeltaM, float64(fileStatusDeltaMPages),
 			"population=%d rate=%d: per-query ΔM of %v pages exceeds the %d-page bound",
 			res.point.mountSize, res.point.queryRate, res.avgDeltaM, fileStatusDeltaMPages)

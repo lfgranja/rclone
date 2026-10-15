@@ -31,11 +31,13 @@ package vfs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/quick"
 	"time"
@@ -628,6 +630,71 @@ func seedFileStatusStateCacheRanges(t *testing.T, vfs *VFS, name string, object 
 	}
 }
 
+// fileStatusStateIndexedMount returns the indexed fs identifier
+// vfs/list reports for the nth VFS over the shared test remote
+// (FR-010): fstest.NewRun shares one remote name across runs, so a
+// test with two or more VFSes alive addresses each by its index in
+// creation order, the way TestFileStatusBCESharedConfigBareName
+// addresses its shared-config mounts. Tests hold no parallelism,
+// so the indices match creation order exactly.
+func fileStatusStateIndexedMount(r *fstest.Run, index int) string {
+	return fmt.Sprintf("%s[%d]", fs.ConfigString(r.Fremote), index)
+}
+
+// holdFileStatusStateResetInFlight arranges a cached file and starts
+// a cache reset that blocks inside the replacement object's Size
+// while holding the item lock — the deterministic mid-reset
+// arrangement of TestFileStatusObservationResetDoesNotWait
+// (fileStatusResetBarrierObject) — and returns the file's host path.
+// While the reset is held, the endpoint reports the file as
+// underivable without waiting for the reset (FR-004, FR-026). The
+// reset is released by cleanup, so the test body only reads.
+func holdFileStatusStateResetInFlight(t *testing.T, r *fstest.Run, vfs *VFS, name, content string) string {
+	t.Helper()
+	arrangeFileStatusStateCachedFile(t, r, vfs, name, content)
+	path := fileStatusStatePath(r, name)
+
+	remoteObject, err := r.Fremote.NewObject(context.Background(), name)
+	require.NoError(t, err)
+	item := vfs.cache.Item(name)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseReset := func() { releaseOnce.Do(func() { close(release) }) }
+	barrierObject := &fileStatusResetBarrierObject{
+		Object:  remoteObject,
+		entered: make(chan struct{}),
+		release: release,
+	}
+	require.NoError(t, item.Open(barrierObject))
+	t.Cleanup(func() {
+		assert.NoError(t, item.Close(nil))
+	})
+
+	barrierObject.armed = true
+	resetDone := make(chan struct{})
+	var resetErr error
+	go func() {
+		_, _, resetErr = item.Reset()
+		close(resetDone)
+	}()
+	t.Cleanup(func() {
+		releaseReset()
+		select {
+		case <-resetDone:
+		case <-time.After(5 * time.Second):
+			t.Errorf("cache reset did not finish after releasing its barrier")
+		}
+		assert.NoError(t, resetErr)
+	})
+
+	select {
+	case <-barrierObject.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset did not reach the locked object-fingerprint barrier")
+	}
+	return path
+}
+
 // drainFileStatusStateWriteback makes every item queued for
 // writeback eligible immediately, so the mount's writeback
 // loop uploads it on its next check and the test's cleanup
@@ -810,7 +877,10 @@ func TestFileStatusStateCacheOffContentValue(t *testing.T) {
 func TestFileStatusStateNotTrackedMountGuard(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeOff, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
-	mount := fs.ConfigString(r.Fremote)
+	// A cache-keeping VFS over the shared test remote joins the
+	// same active name below, so both mounts are addressed by
+	// their indexed names from the start.
+	mount := fileStatusStateIndexedMount(r, 0)
 
 	remoteOnly := arrangeFileStatusStateRemoteFile(t, r, vfs, "remote-only.txt", "on the remote already")
 	writeFileStatusStateThrough(t, vfs, "written-through.txt", "written through a mount that keeps no cache")
@@ -832,7 +902,7 @@ func TestFileStatusStateNotTrackedMountGuard(t *testing.T) {
 	cacheKeeping := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
 	r2, vfs2, call2 := newFileStatusStateRun(t, cacheKeeping)
 	listFileStatusStateRoot(t, vfs2)
-	mount2 := fs.ConfigString(r2.Fremote)
+	mount2 := fileStatusStateIndexedMount(r2, 1)
 	neverWritten := arrangeFileStatusStateRemoteFile(t, r2, vfs2, "never-written.txt", "content")
 	fullyCached := arrangeFileStatusStateCachedFile(t, r2, vfs2, "fully-cached.txt", "content")
 
@@ -985,12 +1055,22 @@ func TestFileStatusStateUploadProvenance(t *testing.T) {
 // caller can tell a file readable offline from its start
 // from one whose held bytes are scattered with gaps.
 func TestFileStatusStatePartlyHeld(t *testing.T) {
-	opt := vfscommon.Opt
-	opt.CacheMode = vfscommon.CacheModeFull
-	opt.ChunkSize = fileStatusStatePartlyHeldRun
-	r, vfs, call := newFileStatusStateRun(t, &opt)
+	// Specific held bytes are seeded into the cache item, the way
+	// TestFileStatusStatePartlyHeldRangeGaps arranges its ranges,
+	// so the fixture does not depend on download buffering, which
+	// fetches the whole file and reports it fully held.
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay)
+	opt.HandleCaching = 0
+	r, vfs, call := newFileStatusStateRunAtRemoteRoot(t, opt)
 	content := "0123456789abcdefghijklmnopqrstuvwxyz"
-	path := arrangeFileStatusStatePartlyCachedFile(t, r, vfs, "partly-cached.txt", content)
+	const name = "partly-cached.txt"
+	path := arrangeFileStatusStateRemoteFile(t, r, vfs, name, content)
+	object, err := r.Fremote.NewObject(context.Background(), name)
+	require.NoError(t, err)
+	seedFileStatusStateCacheRanges(t, vfs, name, object,
+		fileStatusStateCacheRange{offset: 0, content: []byte(content[:fileStatusStatePartlyHeldRun])},
+		fileStatusStateCacheRange{offset: 2 * fileStatusStatePartlyHeldRun, content: []byte(content[2*fileStatusStatePartlyHeldRun : 3*fileStatusStatePartlyHeldRun])},
+	)
 
 	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
 	result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
@@ -1000,17 +1080,9 @@ func TestFileStatusStatePartlyHeld(t *testing.T) {
 	assert.Equal(t, statusNotApplicable, upload)
 
 	unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
-	require.True(t, unbrokenRun.IsNumber, "the unbroken run is the marker %q", unbrokenRun.Marker)
-	require.True(t, totalHeld.IsNumber, "the total held is the marker %q", totalHeld.Marker)
+	requireFileStatusByteNumber(t, unbrokenRun, fileStatusStatePartlyHeldRun)
+	requireFileStatusByteNumber(t, totalHeld, 2*fileStatusStatePartlyHeldRun)
 	requireFileStatusByteNumber(t, totalSize, int64(len(content)))
-	// The run is a proper, non-empty part of the file, and
-	// the total held is at least the run and at most the
-	// file.
-	assert.Greater(t, unbrokenRun.Number, int64(0))
-	assert.Less(t, unbrokenRun.Number, int64(len(content)))
-	assert.Greater(t, totalHeld.Number, int64(0))
-	assert.GreaterOrEqual(t, totalHeld.Number, unbrokenRun.Number)
-	assert.LessOrEqual(t, totalHeld.Number, int64(len(content)))
 
 	assert.Equal(t, exitNotFullyHeld, fileStatusExitCode(local, upload, true))
 	assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
@@ -1234,11 +1306,13 @@ func TestFileStatusStateNotRegularFile(t *testing.T) {
 	opt.CacheMode = vfscommon.CacheModeFull
 	opt.Links = true
 	r, vfs, call := newFileStatusStateRun(t, &opt)
-	listFileStatusStateRoot(t, vfs)
-	// A link file on the remote: the mount started to show
-	// links presents it as the symlink its suffix-less name
-	// names, carrying the path the link points at.
+	// A link file on the remote, written before the mount lists
+	// its parent so the listing the state read decides existence
+	// from holds the entry (T069 listing-only rule): the mount
+	// started to show links presents it as the symlink its
+	// suffix-less name names, carrying the path the link points at.
 	r.WriteObject(context.Background(), "link.rclonelink", "/target/of/link", t1)
+	listFileStatusStateRoot(t, vfs)
 	path := fileStatusStatePath(r, "link")
 
 	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
@@ -1273,8 +1347,12 @@ func TestFileStatusStateCacheOffNotRegularFile(t *testing.T) {
 	opt.CacheMode = vfscommon.CacheModeOff
 	opt.Links = true
 	r, vfs, call := newFileStatusStateRun(t, &opt)
-	listFileStatusStateRoot(t, vfs)
+	// Written before the mount lists its parent so the listing
+	// the state read decides existence from holds the entry
+	// (T069 listing-only rule), the same order the
+	// TestFileStatusStateNotRegularFile fixture uses.
 	r.WriteObject(context.Background(), "link.rclonelink", "/target/of/link", t1)
+	listFileStatusStateRoot(t, vfs)
 	path := fileStatusStatePath(r, "link")
 
 	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
@@ -1546,7 +1624,10 @@ func TestFileStatusStateUnknownParameterIgnored(t *testing.T) {
 func TestFileStatusStateSingleObservationInstant(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
-	mount := fs.ConfigString(r.Fremote)
+	// A second VFS over the shared test remote joins the same
+	// active name below, so both mounts are addressed by their
+	// indexed names.
+	mount := fileStatusStateIndexedMount(r, 0)
 	neverWritten := arrangeFileStatusStateRemoteFile(t, r, vfs, "never-written.txt", "content")
 	fullyCached := arrangeFileStatusStateCachedFile(t, r, vfs, "fully-cached.txt", "content")
 
@@ -1564,7 +1645,7 @@ func TestFileStatusStateSingleObservationInstant(t *testing.T) {
 		paths []string
 	}{
 		{call, mount, []string{neverWritten, fullyCached}},
-		{call2, fs.ConfigString(r2.Fremote), []string{partlyCached}},
+		{call2, fileStatusStateIndexedMount(r2, 1), []string{partlyCached}},
 	} {
 		doc := fileStatusStateCall(t, query.call, query.mount, query.paths)
 		statuses := fileStatusStateStatuses(t, doc)
@@ -1591,17 +1672,17 @@ func TestFileStatusStateSingleObservationInstant(t *testing.T) {
 // The derivation (vfs/file_status.go fileStatusOf, T020) is
 // implemented; the fault-injection hooks live in
 // file_status_failure_test.go and file_status_observation_test.go.
-// The cases below use the plain local fixtures and document the
-// contract each hook must satisfy, failing where the plain fixture
-// cannot arrange the state on its own.
+// The cases below arrange those hooks — the error-injecting
+// remote, the mid-reset barrier and the release-gated upload
+// steps — and assert the state, the byte quantities and the
+// exit status FR-027 maps each pair to.
 func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 	content := "0123456789"
 
 	t.Run("download_failed", func(t *testing.T) {
-		// Needs a remote whose read of the file fails after caching
-		// part of it — an error-injecting remote or a fault
-		// hook on the download path (see
-		// TestFileStatusPartialDownloadFailureClearsAfterSuccessfulRetry).
+		// A remote whose read of the file fails after caching
+		// part of it — the error-injecting remote of
+		// TestFileStatusPartialDownloadFailureClearsAfterSuccessfulRetry.
 		// The contract: the local fact takes the failure value, not partly_held, and
 		// the held quantities still describe the bytes that
 		// did arrive, so a caller can tell a mount that lost
@@ -1610,32 +1691,46 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 		// is not fully held and takes the not-fully-held-
 		// locally status, never the upload-not-complete one
 		// (FR-027).
-		r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
-		listFileStatusStateRoot(t, vfs)
-		path := arrangeFileStatusStateRemoteFile(t, r, vfs, "failed-download.txt", content)
+		const name = "failed-download.txt"
+		const partial = 7
+		r, fixture := newFileStatusFailureFixture(t, fileStatusStateOpt(vfscommon.CacheModeFull, fileStatusFailureWriteBackDelay))
+		r.WriteObject(context.Background(), name, content, t1)
+		listFileStatusStateRoot(t, fixture.vfs)
+		path := fileStatusStatePath(r, name)
+		faultErr := errors.New("injected partial download failure")
+		fixture.control.failDownloadPlan(name,
+			fileStatusDownloadFault{after: partial, err: faultErr},
+			fileStatusDownloadFault{err: faultErr},
+		)
 
-		doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
-		result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+		_, _ = fixture.vfs.ReadFile(name)
+		select {
+		case remote := <-fixture.control.downloadErrors:
+			assert.Equal(t, name, remote)
+		case <-time.After(fileStatusFailureWaitTimeout):
+			t.Fatal("the injected download error was not reached")
+		}
+
+		result := fileStatusFailureResult(t, r, fixture, path)
 
 		local, upload := requireFileStatusStatePair(t, result)
 		assert.Equal(t, statusDownloadFailed, local)
 		assert.Equal(t, statusNotApplicable, upload)
 
 		unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+		requireFileStatusByteNumber(t, unbrokenRun, partial)
+		requireFileStatusByteNumber(t, totalHeld, partial)
 		requireFileStatusByteNumber(t, totalSize, int64(len(content)))
-		assert.GreaterOrEqual(t, unbrokenRun.Number, int64(0))
-		assert.GreaterOrEqual(t, totalHeld.Number, unbrokenRun.Number)
-		assert.LessOrEqual(t, totalHeld.Number, int64(len(content)))
 
 		assert.Equal(t, exitNotFullyHeld, fileStatusExitCode(local, upload, true))
 		assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
 	})
 
 	t.Run("underivable", func(t *testing.T) {
-		// Needs the file's cache record to be mid-rewrite by a
-		// concurrent reset when the read lands — a reset hook
-		// that holds the record open (see
-		// TestFileStatusObservationResetDoesNotWait). The contract: the mount
+		// The file's cache record mid-rewrite by a concurrent
+		// reset when the read lands — the reset hook holding
+		// the record open of
+		// TestFileStatusObservationResetDoesNotWait. The contract: the mount
 		// holds a cache entry it cannot derive the held bytes
 		// from, the one condition that produces underivable
 		// (FR-004), so both held quantities carry the
@@ -1644,8 +1739,7 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 		// not wait for the reset (FR-026), and the pair maps
 		// to the not-fully-held-locally status (FR-027).
 		r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
-		listFileStatusStateRoot(t, vfs)
-		path := arrangeFileStatusStateCachedFile(t, r, vfs, "mid-reset.txt", content)
+		path := holdFileStatusStateResetInFlight(t, r, vfs, "mid-reset.txt", content)
 
 		doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
 		result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
@@ -1663,20 +1757,28 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 	})
 
 	t.Run("uploading", func(t *testing.T) {
-		// Needs the file's upload to be in flight when the read
-		// lands — a slow remote that keeps the writeback upload
-		// open (see TestFileStatusUploadInFlight).
+		// The file's upload in flight when the read lands — a
+		// slow remote keeping the writeback upload open, the
+		// release-gated upload step of TestFileStatusUploadInFlight.
 		// The contract: the upload fact is uploading, the
 		// writeback item being transferred, while the local
 		// fact reports the written content held in full. The
 		// pair maps to the upload-not-complete status, the
 		// upload fact being outstanding work (FR-027).
-		r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
-		writeFileStatusStateThrough(t, vfs, "in-flight.txt", content)
-		path := fileStatusStatePath(r, "in-flight.txt")
+		releaseUpload := make(chan struct{})
+		var releaseOnce sync.Once
+		unblockUpload := func() { releaseOnce.Do(func() { close(releaseUpload) }) }
+		defer unblockUpload()
 
-		doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
-		result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+		r, fixture := newFileStatusFailureFixture(t, fileStatusStateOpt(vfscommon.CacheModeFull, fileStatusFailureWriteBackDelay))
+		fixture.control.setUploadSteps(fileStatusUploadStep{release: releaseUpload})
+		writeFileStatusStateThrough(t, fixture.vfs, "in-flight.txt", content)
+		path := fileStatusStatePath(r, "in-flight.txt")
+		drainFileStatusStateWriteback(t, fixture.vfs)
+		attempt := receiveFileStatusUploadAttempt(t, fixture.control)
+		assert.Contains(t, attempt.remote, "in-flight.txt")
+
+		result := fileStatusFailureResult(t, r, fixture, path)
 
 		local, upload := requireFileStatusStatePair(t, result)
 		assert.Equal(t, statusFullyHeld, local)
@@ -1689,13 +1791,15 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 
 		assert.Equal(t, exitUploadNotComplete, fileStatusExitCode(local, upload, true))
 		assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+
+		unblockUpload()
+		waitForFileStatusUploadState(t, r, fixture, path, "uploaded")
 	})
 
 	t.Run("upload_failed", func(t *testing.T) {
-		// Needs the file's upload to fail on this mount instance —
-		// a remote whose writes fail, so the writeback item's
-		// in-memory error field is set (see
-		// TestFileStatusUploadFailureRetriesAndClearsAfterSuccess).
+		// The file's upload failed on this mount instance — a
+		// remote whose writes fail, the trapped upload error of
+		// TestFileStatusUploadFailureRetriesAndClearsAfterSuccess.
 		// The contract: the upload fact is upload_failed, a failure reported
 		// for the life of the mount that observed it and not
 		// carried across a restart, while the local fact
@@ -1703,12 +1807,15 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 		// upload never produces the query-failed status,
 		// because the query was answered and the answer is
 		// that the file is outstanding work (FR-027, FR-028).
-		r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
-		writeFileStatusStateThrough(t, vfs, "failed-upload.txt", content)
+		r, fixture := newFileStatusFailureFixture(t, fileStatusStateOpt(vfscommon.CacheModeFull, fileStatusFailureWriteBackDelay))
+		fixture.control.setUploadSteps(fileStatusUploadStep{err: errors.New("injected upload failure")})
+		writeFileStatusStateThrough(t, fixture.vfs, "failed-upload.txt", content)
 		path := fileStatusStatePath(r, "failed-upload.txt")
 
-		doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
-		result := fileStatusStateResult(t, fileStatusStateStatuses(t, doc), path)
+		drainFileStatusStateWriteback(t, fixture.vfs)
+		attempt := receiveFileStatusUploadAttempt(t, fixture.control)
+		assert.Contains(t, attempt.remote, "failed-upload.txt")
+		result := waitForFileStatusUploadSettled(t, r, fixture, path)
 
 		local, upload := requireFileStatusStatePair(t, result)
 		assert.Equal(t, statusFullyHeld, local)
@@ -1734,13 +1841,13 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 // entry it draws is never held up by one.
 //
 // The deterministic mid-reset arrangement lives in
+// holdFileStatusStateResetInFlight, the reset hook of
 // TestFileStatusObservationResetDoesNotWait; this case pins the
-// non-blocking contract on a plain cached fixture.
+// non-blocking contract while the reset is held open.
 func TestFileStatusStateUnderivableNonBlocking(t *testing.T) {
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
-	listFileStatusStateRoot(t, vfs)
 	content := "0123456789"
-	path := arrangeFileStatusStateCachedFile(t, r, vfs, "mid-reset.txt", content)
+	path := holdFileStatusStateResetInFlight(t, r, vfs, "mid-reset.txt", content)
 
 	start := time.Now()
 	doc := fileStatusStateCall(t, call, fs.ConfigString(r.Fremote), []string{path})
@@ -1903,7 +2010,10 @@ func TestFileStatusStateByteInvariantsFromEndpoint(t *testing.T) {
 	// size.
 	r, vfs, call := newFileStatusStateRun(t, fileStatusStateOpt(vfscommon.CacheModeFull, writeBackDelay))
 	listFileStatusStateRoot(t, vfs)
-	mount := fs.ConfigString(r.Fremote)
+	// Two more VFSes over the shared test remote join the same
+	// active name below, so each mount is addressed by its
+	// indexed name.
+	mount := fileStatusStateIndexedMount(r, 0)
 	neverWritten := arrangeFileStatusStateRemoteFile(t, r, vfs, "never-written.txt", "0123456789")
 	fullyCached := arrangeFileStatusStateCachedFile(t, r, vfs, "fully-cached.txt", "0123456789")
 
@@ -1924,7 +2034,7 @@ func TestFileStatusStateByteInvariantsFromEndpoint(t *testing.T) {
 	r2, vfs2, call2 := newFileStatusStateRun(t, &opt)
 	partlyCached := arrangeFileStatusStatePartlyCachedFile(t, r2, vfs2, "partly-cached.txt", "0123456789abcdefghijklmnopqrstuvwxyz")
 
-	doc2 := fileStatusStateCall(t, call2, fs.ConfigString(r2.Fremote), []string{partlyCached})
+	doc2 := fileStatusStateCall(t, call2, fileStatusStateIndexedMount(r2, 1), []string{partlyCached})
 	statuses2 := fileStatusStateStatuses(t, doc2)
 	result := fileStatusStateResult(t, statuses2, partlyCached)
 	local, _ := requireFileStatusStatePair(t, result)
@@ -1938,11 +2048,14 @@ func TestFileStatusStateByteInvariantsFromEndpoint(t *testing.T) {
 	opt2.CacheMode = vfscommon.CacheModeFull
 	opt2.Links = true
 	r3, vfs3, call3 := newFileStatusStateRun(t, &opt2)
-	listFileStatusStateRoot(t, vfs3)
+	// Written before the mount lists its parent so the listing
+	// the state read decides existence from holds the entry
+	// (T069 listing-only rule).
 	r3.WriteObject(context.Background(), "link.rclonelink", "/target/of/link", t1)
+	listFileStatusStateRoot(t, vfs3)
 	link := fileStatusStatePath(r3, "link")
 
-	doc3 := fileStatusStateCall(t, call3, fs.ConfigString(r3.Fremote), []string{link})
+	doc3 := fileStatusStateCall(t, call3, fileStatusStateIndexedMount(r3, 2), []string{link})
 	statuses3 := fileStatusStateStatuses(t, doc3)
 	result = fileStatusStateResult(t, statuses3, link)
 	local, _ = requireFileStatusStatePair(t, result)

@@ -327,7 +327,7 @@ func fileStatusBarrierReadsErr(n int, read func() error, sampleReset func() bool
 			starts[i] = start
 			current := inFlight.Add(1)
 			for {
-				peak := maxInflight
+				peak := atomic.LoadInt64(&maxInflight)
 				if current <= peak || atomic.CompareAndSwapInt64(&maxInflight, peak, current) {
 					break
 				}

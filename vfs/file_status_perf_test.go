@@ -867,6 +867,14 @@ func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
 	}
 	require.NoError(t, vfs.WriteFile(target, targetPayload, 0o644))
 	fileStatusWaitClean(t, vfs, target, 120*time.Second)
+	// The cache item the reset acts on, resolved once: each
+	// run re-points its remote object at a barrier object
+	// (fileStatusResetBarrierObject) that holds the reset
+	// engaged until the read burst has finished, making the
+	// reset-overlap proof deterministic instead of racing
+	// goroutine wake-up latency against a ~1 ms disk window.
+	item := vfs.cache.Item(target)
+	require.NotNil(t, item, "cache entry for %q vanished before the latency window", target)
 	// Hold the file open so the reset takes the engaged
 	// path; without an open it is removed instantly and
 	// no reset window exists to span.
@@ -902,16 +910,30 @@ func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
 		for i := 0; i < warmup; i++ {
 			require.NoError(t, read(), "run %d warm-up read %d", run, i)
 		}
-		// One engaged reset and the 100 reads: the reads park
-		// first (50 ms settle), then the reset starts and the
-		// release is gated on the file being observed under
-		// reset — the same IsBeingReset probe each read
-		// samples with — so the reset window contains the
-		// read burst instead of racing it from a shared
-		// barrier. The barrier/allStarted accounting shape
-		// below is the fileStatusBarrierReadsErr pattern:
-		// allStarted gates only the in-flight accounting,
-		// never the timing.
+		// One engaged reset and the 100 reads: the reads park,
+		// then the reset is started with the target's remote
+		// object re-pointed at a barrier object
+		// (fileStatusResetBarrierObject) whose Size() blocks
+		// inside _checkObject — after beingReset is set and
+		// while the item lock is held — until the reads have
+		// finished. The engaged window therefore provably
+		// contains the whole read burst whatever the
+		// scheduler does with goroutine wake-up, instead of
+		// racing a ~1 ms reset against wake latency. The
+		// barrier/allStarted accounting shape below is the
+		// fileStatusBarrierReadsErr pattern: allStarted
+		// gates only the in-flight accounting, never the
+		// timing.
+		remoteObj, err := r.Fremote.NewObject(context.Background(), "under-load.txt")
+		require.NoError(t, err, "run %d creating the reset barrier object", run)
+		barrierRelease := make(chan struct{})
+		barrier := &fileStatusResetBarrierObject{
+			Object:  remoteObj,
+			entered: make(chan struct{}),
+			release: barrierRelease,
+		}
+		require.NoError(t, item.Open(barrier), "run %d opening the reset barrier object", run)
+		barrier.armed = true
 		release := make(chan struct{})
 		resetDone := make(chan struct{})
 		var outcome fileStatusResetOutcome
@@ -958,48 +980,42 @@ func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
 			}(i)
 		}
 		time.Sleep(50 * time.Millisecond)
-		// Start the reset after the reads are parked so the
-		// 50 ms settle consumes no reset window, then
-		// re-assert reset in flight before releasing the
-		// reads: the release waits until the same
-		// IsBeingReset probe the reads sample with is true,
-		// so every run's 100-read burst starts inside the
+		// Start the reset now that every read is parked. It
+		// engages and blocks on the barrier with beingReset
+		// set, so the release below happens inside the
 		// engaged window.
 		go func() {
 			outcome = fileStatusDoReset(vfs, target)
 			close(resetDone)
 		}()
-		gated := false
-		resetFinishedEarly := false
-		gateDeadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(gateDeadline) {
-			if item := vfs.cache.Item(target); item != nil && item.IsBeingReset() {
-				gated = true
-				break
-			}
-			select {
-			case <-resetDone:
-				resetFinishedEarly = true
-			default:
-			}
-			if resetFinishedEarly {
-				break
-			}
-			runtime.Gosched()
+		select {
+		case <-barrier.entered:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("run %d: the engaged reset never reached the barrier within 30s: the reads would run against an idle file", run)
 		}
-		if resetFinishedEarly {
-			<-resetDone
-			require.True(t, gated,
-				"run %d: reset finished before the release (result=%v): no reset window existed to span", run, outcome.result)
-		}
-		require.True(t, gated,
-			"run %d: reset never observed in flight within 30s: the reads would run against an idle file", run)
 		windowStart := time.Now()
 		cpuStart, cpuErr := fileStatusProcessCPUNS()
 		require.NoError(t, cpuErr, "run %d reading the process CPU clock", run)
 		close(release)
-		wg.Wait()
+		readsDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(readsDone)
+		}()
+		// Healthy reads return without waiting on the reset;
+		// the wait is bounded so that a read which does wait
+		// on the reset condition still finishes (once the
+		// barrier is released) and is failed by the latency
+		// ceiling rather than hanging the test.
+		select {
+		case <-readsDone:
+		case <-time.After(2 * fileStatusLatencyCeiling):
+			t.Logf("run %d: reads did not finish within %v while the reset was held; releasing the reset so they can complete", run, 2*fileStatusLatencyCeiling)
+		}
+		close(barrierRelease)
 		<-resetDone
+		<-readsDone
+		require.NoError(t, item.Close(nil), "run %d releasing the reset barrier object", run)
 		for i, err := range errs {
 			require.NoError(t, err, "run %d measured read %d", run, i)
 		}

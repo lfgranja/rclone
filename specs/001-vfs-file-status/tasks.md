@@ -286,7 +286,7 @@ run sequentially with the same agent; only independent tasks are `[P]`.
 - [ ] T099 **MEDIUM** Install `golangci-lint` in CI/environment and execute `make check`; record command + output showing clean lint per Constitution V / T094 / VERIFICATION.md §T052 (partial)
 - [ ] T100 **MEDIUM** Resolve `/tmp` exhaustion blocking full `go test ./...` and full `-race`; capture focused `go test ./vfs/ -run TestFileStatus -count=1 -race` command + PASS output for T053 retry per Constitution IV / T095 (partial)
 - [ ] T101 **MEDIUM** Document flakiness source for `TestFileStatusPerfWSSMRC` (SC-027 resource harness): confirm intermittency is system memory pressure exceeding 128-page RSS tolerance, not a code defect; state harness tolerance / skip conditions in test doc or harness config per SC-027 / T096 (partial)
-- [ ] T102 **LOW** Update `plan.md` §Project Structure to reflect actual paths (`vfs/file_status.go`, `vfs/file_status_types.go`, `cmd/vfs/status/status.go`, `fs/rc/file_status_error.go`) vs predicted (`fs/file_status.go`, `backend/vfs/file_status.go`, `file_status_fstest.go`, etc.) per plan accuracy / T097 (unrequested)
+- [X] T102 **LOW** Update `plan.md` §Project Structure to reflect actual paths (`vfs/file_status.go`, `vfs/file_status_types.go`, `cmd/vfs/status/status.go`, `fs/rc/file_status_error.go`) vs predicted (`fs/file_status.go`, `backend/vfs/file_status.go`, `file_status_fstest.go`, etc.) per plan accuracy / T097 (unrequested)
 
 **Verification attestation (Constitution IV)**: Only T098–T102 (followed by T092 / Phase 6 verification replay) can fully attest completion. Mechanism verified; formal command+output records still pending for SC-015/019/021/026/027.
 
@@ -296,7 +296,7 @@ run sequentially with the same agent; only independent tasks are `[P]`.
 
 Property-based gaps from subagent (`ses_ebe1ed26effeDneM4UCHkyHe20`): T011 whole-request delivery has structural tests but no `testing/quick` property for error-shape; T016 perf harness is comment-only, no property function. Both are secondary to the contradiction.
 
-- [ ] T103 **CRITICAL** Remove FR-005 contradiction in `vfs/file_status.go` L53/L82: eliminate `v.f.NewObject` remote lookup on missing record / `cacheOff`; instead set `TotalKnown=false` and render `total_size` as `not_determinable`; verify byte invariants remain (fully_held / partly_held / not_held / underivable) with `quick.Check`; per FR-005 / FR-002 / Constitution I / II / subagent A evidence
+- [X] T103 **CRITICAL** Remove FR-005 contradiction in `vfs/file_status.go` L53/L82: eliminate `v.f.NewObject` remote lookup on missing record / `cacheOff`; instead set `TotalKnown=false` and render `total_size` as `not_determinable`; verify byte invariants remain (fully_held / partly_held / not_held / underivable) with `quick.Check`; per FR-005 / FR-002 / Constitution I / II / subagent A evidence
 - [ ] T104 **MEDIUM** Add `quick.Check` property for whole-request delivery (T011): for arbitrary invalid parameter combinations (`empty_path`, `no_active_mount`, `ambiguous_mount`, invalid value), assert always returns typed `FileStatusError` with correct `code`/`message` and `Status` (400) and no `path` field; file `vfs/file_status_test.go` / `cmd/vfs/status/status_test.go`
 - [ ] T105 **LOW** Add `testing/quick` property for SC-010 harness structure (T016): assert harness parameters (discard-first-20 >=5-floor, independent concurrent reads, per-run max <=100ms, reset window) compile and initialize correctly; file `vfs/file_status_perf_test.go`
 

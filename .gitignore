@@ -2,6 +2,7 @@
 _junk/
 rclone
 rclone.exe
+*.exe
 build
 /docs/public/
 /docs/.hugo_build.lock
@@ -18,6 +19,8 @@ fuzz-build.zip
 *.orig
 *.rej
 Thumbs.db
+*.tmp
+*.swp
 __pycache__
 .DS_Store
 resource_windows_*.syso

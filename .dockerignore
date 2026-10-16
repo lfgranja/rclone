@@ -1,0 +1,8 @@
+node_modules/
+Dockerfile*
+.dockerignore
+*.log*
+.env*
+coverage/
+
+# The root Dockerfile runs make, which reads git metadata to set fs.Version.

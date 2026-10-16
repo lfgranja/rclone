@@ -271,9 +271,17 @@ func TestRcList(t *testing.T) {
 	out, err := call.Fn(context.Background(), nil)
 	require.NoError(t, err)
 
+	// FR-014 grants the sole exception to leaving existing surfaces
+	// alone: vfs/list keeps its vfses array byte-for-byte unchanged
+	// and gains a mountPoints key beside it (SC-015 procedure:
+	// existing keys byte-for-byte + new key present). Null here
+	// because an in-process test VFS has no host mount point.
 	assert.Equal(t, rc.Params{
 		"vfses": []string{
 			fs.ConfigString(r.Fremote),
+		},
+		"mountPoints": map[string]any{
+			fs.ConfigString(r.Fremote): nil,
 		},
 	}, out)
 }

@@ -41,11 +41,11 @@ func (e *FileStatusError) Error() string {
 // Render returns the response body the endpoint answers with for
 // the rejection: a top-level object carrying the error object of
 // the same shape a per-path error carries, with no path field.
+// The rc server's error writer (writeFileStatusError, called from
+// handlePost before its trailing write) renders this body with
+// e.Status rather than the rc server error mapping status
+// (contracts/api.md "Whole-Request Error Response").
 func (e *FileStatusError) Render() Params {
-	// TODO: Wave 2: the rc server's error writer renders this
-	// inside handlePost before its trailing write, writing
-	// e.Status rather than the rc server error mapping status
-	// (contracts/api.md).
 	return Params{
 		"error": Params{
 			"code":    e.Code,

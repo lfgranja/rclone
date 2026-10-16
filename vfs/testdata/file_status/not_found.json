@@ -1,0 +1,11 @@
+{
+  "statuses": [
+    {
+      "path": "/mnt/test/nonexistent.txt",
+      "error": {
+        "code": "not_found",
+        "message": "File does not exist in mount"
+      }
+    }
+  ]
+}

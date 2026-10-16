@@ -410,6 +410,8 @@ func (m *MountPoint) Mount() (mountDaemon *os.Process, err error) {
 		m.MountPoint = actualMountpoint
 	}
 	m.MountedOn = time.Now()
+	// Register the mount point in the VFS registry
+	vfs.RegisterMountPointForVFS(m.VFS, m.MountPoint)
 	return nil, nil
 }
 
@@ -447,6 +449,10 @@ func (m *MountPoint) Wait() error {
 
 // Unmount the specified mountpoint
 func (m *MountPoint) Unmount() (err error) {
+	// Unregister the mount point from the VFS registry before shutting down
+	if m.VFS != nil {
+		vfs.UnregisterMountPointForVFS(m.VFS)
+	}
 	defer m.shutdownVFS()
 	if m.UnmountFn != nil {
 		return m.UnmountFn()

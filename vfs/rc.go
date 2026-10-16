@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 const getVFSHelp = ` 
@@ -19,6 +24,191 @@ This command takes an "fs" parameter. If this parameter is not
 supplied and if there is only one VFS in use then that VFS will be
 used. If there is more than one VFS in use then the "fs" parameter
 must be supplied.`
+
+// mountPointsMu protects the mountPoints map.
+var mountPointsMu sync.Mutex
+
+// mountPoints maps the indexed VFS name (as returned by vfs/list)
+// to its mount point path. A VFS created without a mount point
+// (in-process, remote-control, or serve usage) is not registered
+// here, so it will not appear in the map.
+var mountPoints = map[string]string{}
+
+// mountAliases preserves every additional live host path served by one
+// VFS instance (deduplicated/shared-config mounts). The first
+// registered path stays the primary (VFS.MountPoint and the single
+// vfs/list string per reported name); further paths are aliases kept
+// for identifier-less resolution and dropped one per Unregister.
+// Protected by mountPointsMu.
+var mountAliases = map[*VFS][]string{}
+
+// RegisterMountPoint registers a mount point for a VFS. The name
+// must be one of the names returned by activeCacheEntries (the
+// indexed form, e.g. "mydrive" or "mydrive[1]").
+func RegisterMountPoint(name, mountPoint string) {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	mountPoints[name] = mountPoint
+}
+
+// UnregisterMountPoint removes a mount point registration for a VFS.
+func UnregisterMountPoint(name string) {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	delete(mountPoints, name)
+}
+
+// GetMountPoint returns the mount point for a VFS by its indexed name,
+// or empty string if the VFS has no registered mount point.
+func GetMountPoint(name string) string {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	return mountPoints[name]
+}
+
+// GetAllMountPoints returns a copy of the mountPoints map.
+func GetAllMountPoints() map[string]string {
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	result := make(map[string]string, len(mountPoints))
+	for k, v := range mountPoints {
+		result[k] = v
+	}
+	return result
+}
+
+// RegisterMountPointForVFS finds the VFS in the active cache and
+// registers its mount point using the correct indexed name.
+//
+// It uses sequential critical sections (activeMu then mountPointsMu,
+// never nested) so vfs/list, path resolution and teardown share one
+// lock order per Constitution I. A second live path on the same VFS
+// instance (deduplicated mount) pushes the previous primary to the
+// alias list and reports the latest path as the single vfs/list
+// string, while every live path still resolves.
+func RegisterMountPointForVFS(vfs *VFS, mountPoint string) {
+	activeMu.Lock()
+	configName := fs.ConfigString(vfs.f)
+	vfses := active[configName]
+	index := -1
+	for i, activeVFS := range vfses {
+		if activeVFS == vfs {
+			index = i
+			break
+		}
+	}
+	var name string
+	var previous string
+	if index >= 0 {
+		name = configName
+		if len(vfses) > 1 {
+			name = fmt.Sprintf("%s[%d]", configName, index)
+		}
+		if vfs.MountPoint != "" && vfs.MountPoint != mountPoint {
+			previous = vfs.MountPoint
+		}
+		vfs.MountPoint = mountPoint
+	}
+	activeMu.Unlock()
+	if index < 0 {
+		fs.Debugf(vfs.f, "RegisterMountPointForVFS: VFS not in active cache, ignoring registration")
+		return
+	}
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	if previous != "" {
+		already := false
+		for _, existing := range mountAliases[vfs] {
+			if existing == previous {
+				already = true
+				break
+			}
+		}
+		if !already {
+			mountAliases[vfs] = append(mountAliases[vfs], previous)
+		}
+		for _, existing := range mountAliases[vfs] {
+			if existing == mountPoint {
+				// New point already aliased (re-registration); keep display latest.
+				mountPoints[name] = mountPoint
+				return
+			}
+		}
+		fs.Debugf(vfs.f, "RegisterMountPointForVFS: preserved previous primary as alias, reporting latest")
+	}
+	mountPoints[name] = mountPoint
+}
+
+// UnregisterMountPointForVFS finds the VFS in the active cache and
+// unregisters its mount point using the correct indexed name.
+//
+// It uses sequential critical sections (never nested) so vfs/list,
+// path resolution and teardown share one lock order per Constitution
+// I. Unregistering one reference of a shared VFS drops the reported
+// primary and promotes the most recent alias, so the surviving live
+// path stays reported; only the last unregister clears the primary.
+func UnregisterMountPointForVFS(vfs *VFS) {
+	mountPointsMu.Lock()
+	aliases := mountAliases[vfs]
+	var promoted string
+	if len(aliases) > 0 {
+		promoted = aliases[len(aliases)-1]
+		aliases = aliases[:len(aliases)-1]
+		if len(aliases) == 0 {
+			delete(mountAliases, vfs)
+		} else {
+			mountAliases[vfs] = aliases
+		}
+	}
+	mountPointsMu.Unlock()
+	activeMu.Lock()
+	configName := fs.ConfigString(vfs.f)
+	vfses := active[configName]
+	index := -1
+	for i, activeVFS := range vfses {
+		if activeVFS == vfs {
+			index = i
+			break
+		}
+	}
+	var name string
+	if index >= 0 {
+		name = configName
+		if len(vfses) > 1 {
+			name = fmt.Sprintf("%s[%d]", configName, index)
+		}
+		if promoted != "" {
+			vfs.MountPoint = promoted
+		} else {
+			vfs.MountPoint = ""
+		}
+	} else {
+		if promoted != "" {
+			vfs.MountPoint = promoted
+		} else {
+			vfs.MountPoint = ""
+		}
+		activeMu.Unlock()
+		if promoted != "" {
+			// VFS already gone from active but an alias survives for
+			// cleanup ordering; report it under the bare name.
+			mountPointsMu.Lock()
+			mountPoints[configName] = promoted
+			mountPointsMu.Unlock()
+		}
+		fs.Debugf(vfs.f, "UnregisterMountPointForVFS: VFS not in active cache, promoted alias if any")
+		return
+	}
+	activeMu.Unlock()
+	mountPointsMu.Lock()
+	defer mountPointsMu.Unlock()
+	if promoted != "" {
+		mountPoints[name] = promoted
+		fs.Debugf(vfs.f, "UnregisterMountPointForVFS: promoted alias to primary")
+		return
+	}
+	delete(mountPoints, name)
+}
 
 // GetVFS gets a VFS with config name "fs" from the cache or returns an error.
 //
@@ -390,26 +580,59 @@ This lists the active VFSes.
 
 It returns a list under the key "vfses" where the values are the VFS
 names that could be passed to the other VFS commands in the "fs"
-parameter.`,
+parameter.
+
+It also returns a "mountPoints" object mapping each VFS name to its
+mount point path, or null for a VFS created without a mount point
+(in-process, remote-control, or serve usage).`,
 		Fn: rcList,
 	})
 }
 
 func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	// Single critical section on activeMu only: copy the active VFS
+	// pointers and their mount points, then build the report without
+	// holding any lock. This removes the activeMu->mountPointsMu
+	// nesting (the inversion resolveVFSForPath held the opposite
+	// order) while keeping the vfses shape unchanged per FR-014.
+	type vfsEntry struct {
+		mountPoint string
+	}
+	snapshot := make(map[string][]vfsEntry, len(active))
 	activeMu.Lock()
-	defer activeMu.Unlock()
-	var names = []string{}
 	for name, vfses := range active {
-		if len(vfses) == 1 {
+		entries := make([]vfsEntry, 0, len(vfses))
+		for _, v := range vfses {
+			entries = append(entries, vfsEntry{mountPoint: v.MountPoint})
+		}
+		snapshot[name] = entries
+	}
+	activeMu.Unlock()
+	var names = []string{}
+	mountPointsMap := make(map[string]any)
+	for name, entries := range snapshot {
+		if len(entries) == 1 {
 			names = append(names, name)
+			if entries[0].mountPoint != "" {
+				mountPointsMap[name] = entries[0].mountPoint
+			} else {
+				mountPointsMap[name] = nil
+			}
 		} else {
-			for i := range vfses {
-				names = append(names, fmt.Sprintf("%s[%d]", name, i))
+			for i, e := range entries {
+				indexedName := fmt.Sprintf("%s[%d]", name, i)
+				names = append(names, indexedName)
+				if e.mountPoint != "" {
+					mountPointsMap[indexedName] = e.mountPoint
+				} else {
+					mountPointsMap[indexedName] = nil
+				}
 			}
 		}
 	}
 	out = rc.Params{}
 	out["vfses"] = names
+	out["mountPoints"] = mountPointsMap
 	return out, nil
 }
 
@@ -604,8 +827,737 @@ are the per-path result objects.
 // rcFileStatus reports the local cache and upload state of the
 // files named in the "paths" parameter.
 func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	// TODO: implement the decision order (specs/001-vfs-file-status/spec.md
-	// FR-006). Until then the endpoint answers every request with the
-	// whole-request empty_path rejection of contracts/api.md.
-	return nil, errors.New("empty_path: paths is empty or an entry is not absolute")
+	// Decision order level 1: Request shape validation
+	// Check paths parameter exists and is an array
+	pathsRaw, ok := in["paths"]
+	if !ok {
+		return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", 400)
+	}
+
+	// Handle both []any and []string (the latter is what Go produces for JSON arrays of strings)
+	var pathsSlice []any
+	switch v := pathsRaw.(type) {
+	case []any:
+		pathsSlice = v
+	case []string:
+		pathsSlice = make([]any, len(v))
+		for i, s := range v {
+			pathsSlice[i] = s
+		}
+	default:
+		return nil, rc.NewFileStatusError("param_invalid", "paths must be an array", 400)
+	}
+
+	if len(pathsSlice) == 0 {
+		return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", 400)
+	}
+
+	// Convert to string slice, checking for non-string entries
+	paths := make([]string, len(pathsSlice))
+	for i, v := range pathsSlice {
+		s, ok := v.(string)
+		if !ok {
+			return nil, rc.NewFileStatusError("param_invalid", "paths entries must be strings", 400)
+		}
+		paths[i] = s
+	}
+
+	// Check all paths are absolute (after cleaning)
+	for _, path := range paths {
+		cleaned := filepath.Clean(path)
+		if !filepath.IsAbs(cleaned) {
+			return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", 400)
+		}
+	}
+
+	// Decision order level 2: Identifier resolution
+	// A non-string fs value is malformed and takes the typed
+	// param_invalid contract error, not the generic rc envelope.
+	var fsString string
+	var hasFsParam bool
+	if rawFs, ok := in["fs"]; ok {
+		s, ok := rawFs.(string)
+		if !ok {
+			return nil, rc.NewFileStatusError("param_invalid", fmt.Sprintf("invalid value for %q: expecting string", "fs"), 400)
+		}
+		fsString = s
+		hasFsParam = true
+	}
+
+	var vfsInstance *VFS
+	var vfsName string
+	var selectedMountPoint string
+	var selectedAliases []string
+	var resolvedMountPoint string
+
+	if hasFsParam {
+		// Identifier provided - resolve the bare or indexed name
+		// emitted by vfs/list and Hold the selected VFS while
+		// holding activeMu so unmount cannot tear it down
+		// mid-request. The Held reference is released with Shutdown
+		// after the per-path results are assembled. A VFS without
+		// a mount point is never given a synthesized host point;
+		// its host paths are rejected per-path as outside_any_mount.
+		baseName, index := parseIndexedName(fsString)
+		baseName = cache.Canonicalize(baseName)
+		activeMu.Lock()
+		vfses := active[baseName]
+		var selected *VFS
+		var resolvedName string
+		if index >= 0 {
+			if index < len(vfses) {
+				selected = vfses[index]
+				resolvedName = fmt.Sprintf("%s[%d]", baseName, index)
+			}
+		} else if len(vfses) == 1 {
+			selected = vfses[0]
+			resolvedName = baseName
+		}
+		if selected != nil {
+			selectedMountPoint = selected.MountPoint
+			if !selected.Hold() {
+				selected = nil
+			}
+		}
+		activeMu.Unlock()
+
+		if selected == nil {
+			if index >= 0 || len(vfses) == 0 {
+				return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("no VFS found with name %q", fsString), 400)
+			}
+			return nil, rc.NewFileStatusError("no_active_mount", fmt.Sprintf("more than one VFS active with name %q", fsString), 400)
+		}
+		mountPointsMu.Lock()
+		if aliases, ok := mountAliases[selected]; ok {
+			selectedAliases = append([]string(nil), aliases...)
+		}
+		mountPointsMu.Unlock()
+		vfsInstance = selected
+		defer vfsInstance.Shutdown()
+		vfsName = resolvedName
+	} else {
+		// No identifier provided
+		if len(paths) > 1 {
+			return nil, rc.NewFileStatusError("ambiguous_mount", "multiple paths provided but no fs parameter", 400)
+		}
+		// Single path - resolve against mount points. The resolver
+		// Holds the selected VFS and reports the matched point;
+		// release the Hold after classification.
+		singlePath := filepath.Clean(paths[0])
+		var matchedPoint string
+		vfsInstance, vfsName, matchedPoint = resolveVFSForPath(singlePath)
+		if vfsInstance == nil {
+			// Path didn't resolve to a VFS. This is a per-path
+			// outside_any_mount result (the call reached the mount
+			// level but the path is outside all registered mount
+			// points). Per FR-006 decision order level 3, this is
+			// a per-path result, not a whole-request rejection.
+			result := buildErrorResult(singlePath, "outside_any_mount", "path lies outside any registered mount point")
+			out = rc.Params{"statuses": []any{result}}
+			return out, nil
+		}
+		defer vfsInstance.Shutdown()
+		resolvedMountPoint = matchedPoint
+	}
+
+	// Now we have a single VFS to query
+	// Decision order level 3: Per-path classification
+	var results []map[string]any
+	for _, path := range paths {
+		cleaned := filepath.Clean(path)
+		var mountPoint string
+		if hasFsParam {
+			// Select the live point of this VFS containing the path
+			// (primary or alias) so deduplicated second paths answer.
+			resolved, ok := resolvePathForMatching(cleaned)
+			if !ok {
+				results = append(results, buildErrorResult(cleaned, "outside_any_mount", "parent link target does not exist"))
+				continue
+			}
+			matched := ""
+			if selectedMountPoint != "" && isPathInsideMountPoint(resolved, filepath.Clean(selectedMountPoint)) {
+				matched = selectedMountPoint
+			} else {
+				for _, aliasPoint := range selectedAliases {
+					if aliasPoint != "" && isPathInsideMountPoint(resolved, filepath.Clean(aliasPoint)) {
+						matched = aliasPoint
+						break
+					}
+				}
+			}
+			if matched == "" {
+				results = append(results, buildErrorResult(cleaned, "outside_any_mount", "path lies outside the mount point"))
+				continue
+			}
+			mountPoint = matched
+		} else {
+			mountPoint = resolvedMountPoint
+		}
+		result := classifyPath(vfsInstance, vfsName, mountPoint, cleaned, hasFsParam)
+		results = append(results, result)
+	}
+
+	out = rc.Params{
+		"statuses": results,
+	}
+	return out, nil
+}
+
+// resolveVFSForPath finds the VFS that owns the given path by checking
+// every live mount point, including alias paths preserved for
+// deduplicated mounts. It Holds the selected VFS before returning;
+// the caller must call Shutdown to release it. It returns the VFS,
+// its current indexed name and the matched mount point, or nil when
+// the path is inside no live point.
+//
+// It uses sequential snapshots (mountPointsMu copies, then activeMu
+// selection with Hold, never nested) so vfs/list and teardown share
+// one lock order and unmount cannot tear the selection down
+// mid-request per Constitution I.
+func resolveVFSForPath(path string) (*VFS, string, string) {
+	mountPointsMu.Lock()
+	displaySnapshot := make(map[string]string, len(mountPoints))
+	for k, v := range mountPoints {
+		displaySnapshot[k] = v
+	}
+	aliasSnapshot := make(map[*VFS][]string, len(mountAliases))
+	for vfs, points := range mountAliases {
+		copied := make([]string, len(points))
+		copy(copied, points)
+		aliasSnapshot[vfs] = copied
+	}
+	mountPointsMu.Unlock()
+
+	cleanPath := filepath.Clean(path)
+	// Resolve parent links without following the final component so
+	// an alias parent still selects its target mount; a dangling
+	// parent names nothing reachable (outside).
+	resolved, ok := resolvePathForMatching(cleanPath)
+	if !ok {
+		return nil, "", ""
+	}
+	cleanPath = resolved
+	// Collect every live candidate: display points resolve through
+	// their indexed names, aliases carry their VFS and point directly.
+	type candidate struct {
+		vfs   *VFS
+		point string
+	}
+	var aliasCandidates []candidate
+	for vfs, points := range aliasSnapshot {
+		for _, point := range points {
+			if point == "" {
+				continue
+			}
+			if isPathInsideMountPoint(cleanPath, filepath.Clean(point)) {
+				aliasCandidates = append(aliasCandidates, candidate{vfs: vfs, point: point})
+			}
+		}
+	}
+	// Find the longest matching display mount point
+	var bestMatch string
+	var bestName string
+
+	for name, mountPoint := range displaySnapshot {
+		if mountPoint == "" {
+			continue
+		}
+		cleanMP := filepath.Clean(mountPoint)
+
+		// Check if path is inside this mount point
+		if isPathInsideMountPoint(cleanPath, cleanMP) {
+			// Prefer the longest mount point (most specific)
+			if len(cleanMP) > len(bestMatch) {
+				bestMatch = cleanMP
+				bestName = name
+			}
+		}
+	}
+
+	// Select and Hold the VFS while holding activeMu only.
+	activeMu.Lock()
+	defer activeMu.Unlock()
+
+	// Aliases first: each carries its VFS, verified live under activeMu.
+	for _, c := range aliasCandidates {
+		stillLive := false
+		for _, vfses := range active {
+			for _, activeVFS := range vfses {
+				if activeVFS == c.vfs {
+					stillLive = true
+					break
+				}
+			}
+			if stillLive {
+				break
+			}
+		}
+		if !stillLive {
+			continue
+		}
+		if !c.vfs.Hold() {
+			continue
+		}
+		// Report the alias under its primary indexed name so the
+		// caller pairs it by name per FR-014, but classify against
+		// the alias point that actually matched.
+		configName := fs.ConfigString(c.vfs.f)
+		vfses := active[configName]
+		resolvedName := configName
+		for i, activeVFS := range vfses {
+			if activeVFS == c.vfs {
+				if len(vfses) > 1 {
+					resolvedName = fmt.Sprintf("%s[%d]", configName, i)
+				}
+				break
+			}
+		}
+		return c.vfs, resolvedName, c.point
+	}
+
+	if bestName == "" {
+		return nil, "", ""
+	}
+
+	// Parse the name to get config name and index
+	configName, index := parseIndexedName(bestName)
+	vfses := active[configName]
+	var bestVFS *VFS
+	if index >= 0 && index < len(vfses) {
+		bestVFS = vfses[index]
+	} else if len(vfses) == 1 && index == -1 {
+		bestVFS = vfses[0]
+	}
+	if bestVFS == nil {
+		// Stale indexed name after teardown (survivor reindexed from
+		// name[1] to bare): fall back to the live VFS whose primary
+		// still serves the matched point.
+		for i, activeVFS := range vfses {
+			if activeVFS.MountPoint != "" && filepath.Clean(activeVFS.MountPoint) == bestMatch {
+				if !activeVFS.Hold() {
+					return nil, "", ""
+				}
+				resolvedName := configName
+				if len(vfses) > 1 {
+					resolvedName = fmt.Sprintf("%s[%d]", configName, i)
+				}
+				return activeVFS, resolvedName, bestMatch
+			}
+		}
+		// Aliases may also survive under a stale display name.
+		for vfs, points := range aliasSnapshot {
+			for _, point := range points {
+				if point != "" && filepath.Clean(point) == bestMatch {
+					stillLive := false
+					for _, activeVFS := range vfses {
+						if activeVFS == vfs {
+							stillLive = true
+							break
+						}
+					}
+					if stillLive && vfs.Hold() {
+						resolvedName := configName
+						for i, activeVFS := range vfses {
+							if activeVFS == vfs {
+								if len(vfses) > 1 {
+									resolvedName = fmt.Sprintf("%s[%d]", configName, i)
+								}
+								break
+							}
+						}
+						return vfs, resolvedName, point
+					}
+				}
+			}
+		}
+		return nil, "", ""
+	}
+	if !bestVFS.Hold() {
+		return nil, "", ""
+	}
+
+	return bestVFS, bestName, bestMatch
+}
+
+// parseIndexedName parses a name like "mydrive[1]" into ("mydrive", 1)
+// or returns ("mydrive", -1) if no index suffix.
+func parseIndexedName(name string) (string, int) {
+	if strings.HasSuffix(name, "]") {
+		bracket := strings.LastIndex(name, "[")
+		if bracket > 0 {
+			indexStr := name[bracket+1 : len(name)-1]
+			if idx, err := strconv.Atoi(indexStr); err == nil {
+				return name[:bracket], idx
+			}
+		}
+	}
+	return name, -1
+}
+
+// isPathInsideMountPoint checks if path is inside mountPoint (at component boundary).
+// Matching is case-insensitive on Windows and case-sensitive elsewhere,
+// with boundary awareness so a sibling sharing the prefix is outside.
+func isPathInsideMountPoint(path, mountPoint string) bool {
+	if runtime.GOOS == "windows" {
+		if strings.EqualFold(path, mountPoint) {
+			return true
+		}
+		if len(path) <= len(mountPoint) {
+			return false
+		}
+		if !strings.EqualFold(path[:len(mountPoint)], mountPoint) {
+			return false
+		}
+		c := path[len(mountPoint)]
+		return c == '\\' || c == '/'
+	}
+	if path == mountPoint {
+		return true
+	}
+	// Check if path starts with mountPoint + separator
+	// Handle root mount point "/" specially to avoid "//" prefix
+	var prefix string
+	if mountPoint == "/" {
+		prefix = "/"
+	} else {
+		prefix = mountPoint + string(filepath.Separator)
+	}
+	return strings.HasPrefix(path, prefix)
+}
+
+// resolvePathForMatching resolves parent symlinks without following the
+// final component, so a path reaching a mount through a linked parent
+// is answered by that mount per FR-009/FR-032. It returns the resolved
+// path for mount matching; false means a dangling parent link names
+// nothing reachable (outside_any_mount). Non-existent VFS-only
+// intermediates are kept lexically so virtual paths still match.
+func resolvePathForMatching(requestPath string) (string, bool) {
+	cleaned := filepath.Clean(requestPath)
+	parent := filepath.Dir(cleaned)
+	base := filepath.Base(cleaned)
+	if parent == cleaned {
+		return cleaned, true
+	}
+	candidate := parent
+	var remainder []string
+	for {
+		if _, err := os.Lstat(candidate); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return cleaned, true
+		}
+		next := filepath.Dir(candidate)
+		if next == candidate {
+			break
+		}
+		remainder = append([]string{filepath.Base(candidate)}, remainder...)
+		candidate = next
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", false
+	}
+	resolvedParent := resolvedCandidate
+	for _, part := range remainder {
+		resolvedParent = filepath.Join(resolvedParent, part)
+	}
+	return filepath.Clean(filepath.Join(resolvedParent, base)), true
+}
+
+// classifyPath classifies a single path against a VFS and its matched
+// mount point and returns the result object. A VFS without a mount
+// point never answers a host path: no point is synthesized for
+// null-mount VFSes, so every host path is outside_any_mount per
+// FR-009/FR-014. Parent links are followed to decide the mount while
+// the final component is never followed per FR-009/FR-032;
+// overlapping matches are ambiguous with no tiebreak.
+func classifyPath(vfsInstance *VFS, vfsName, mountPoint, path string, hasFsParam bool) map[string]any {
+	// Never synthesize a point for a VFS whose mount point is null.
+	if mountPoint == "" {
+		return buildErrorResult(path, "outside_any_mount", "VFS has no mount point")
+	}
+
+	cleanMP := filepath.Clean(mountPoint)
+	cleanPath := filepath.Clean(path)
+	// Resolve parent links for mount matching; a dangling parent is outside.
+	resolvedPath, ok := resolvePathForMatching(cleanPath)
+	if !ok {
+		return buildErrorResult(path, "outside_any_mount", "parent link target does not exist")
+	}
+
+	if !isPathInsideMountPoint(resolvedPath, cleanMP) {
+		return buildErrorResult(path, "outside_any_mount", "path lies outside the mount point")
+	}
+
+	// Check for overlapping mount points (path inside more than one)
+	// Only check for overlap when we don't have an fs identifier (identifier-less resolution)
+	// When fs is provided, we already know which VFS we're querying.
+	// No longest-prefix or first-registered tiebreak: any second match
+	// is the ambiguity failure.
+	if !hasFsParam && isPathInMultipleMountPoints(resolvedPath) {
+		return buildErrorResult(path, "ambiguous_mount", "path lies inside multiple mount points")
+	}
+
+	// Get the relative path within the mount from the resolved path so
+	// an alias parent still maps to the entry it serves.
+	relPath, err := filepath.Rel(cleanMP, resolvedPath)
+	if err != nil {
+		return buildErrorResult(path, "outside_any_mount", "path is not relative to mount point")
+	}
+
+	// Check if the path exists in the VFS
+	root, err := vfsInstance.Root()
+	if err != nil {
+		return buildErrorResult(path, "unaccountable_path", "cannot access VFS root")
+	}
+
+	// Walk the path to find the entry using current local listings only.
+	// not_found comes only from a current listing; a parent with no
+	// current listing is unaccountable. No remote NewObject,
+	// directory-list or listing-refresh call is made below the root.
+	node, _, err := walkToEntry(root, relPath)
+	if err != nil {
+		if errors.Is(err, ENOENT) || os.IsNotExist(err) {
+			return buildErrorResult(path, "not_found", "file does not exist in mount")
+		}
+		if errors.Is(err, errUnaccountable) {
+			return buildErrorResult(path, "unaccountable_path", "parent directory not known")
+		}
+		return buildErrorResult(path, "unaccountable_path", err.Error())
+	}
+
+	// Check if it's a directory
+	if node != nil && node.IsDir() {
+		return buildErrorResult(path, "directory_not_file", "path names a directory")
+	}
+
+	// Check if it's a symlink (non-regular file)
+	if node != nil && vfsInstance.Opt.Links && isSymlink(node) {
+		// Non-regular file
+		return buildNonRegularFileResult(vfsInstance, path)
+	}
+
+	// Regular file - get its status without any remote call. The size
+	// comes from the directory entry the mount already holds; a file
+	// with no cache record is not_held with that size, so no NewObject
+	// lookup is made per FR-002/FR-005. The record is probed, never
+	// created, so the read changes no published cache total.
+	cachePath := relPath
+	if cachePath == "." {
+		cachePath = ""
+	}
+	isLink := false // Final component is not a symlink (we checked above)
+	cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
+
+	var status FileStatus
+	if cacheOff {
+		size := node.Size()
+		status = FileStatus{
+			Local:  FileLocalNotHeld,
+			Upload: FileUploadNotTracked,
+			Bytes: FileByteInfo{
+				UnbrokenRun: 0,
+				TotalHeld:   0,
+				TotalSize:   size,
+				TotalKnown:  size >= 0,
+			},
+			IsDir: false,
+		}
+	} else if vfsInstance.cache == nil || statusProbeHasNoRecord(vfsInstance, cachePath) {
+		size := node.Size()
+		status = FileStatus{
+			Local:  FileLocalNotHeld,
+			Upload: FileUploadNotApplicable,
+			Bytes: FileByteInfo{
+				UnbrokenRun: 0,
+				TotalHeld:   0,
+				TotalSize:   size,
+				TotalKnown:  size >= 0,
+			},
+			IsDir: false,
+		}
+	} else {
+		status = fileStatusOf(vfsInstance, cachePath, isLink, cacheOff)
+	}
+	return buildStatusResult(path, status, cacheOff)
+}
+
+// statusProbeHasNoRecord reports whether a status read would find no
+// cache record for cachePath. Unlike Cache.Item it never creates an
+// index entry, so a status-only probe changes no published cache total
+// (FR-005) and a phantom size-0 entry can never misread as fully_held.
+// A synthesized metadata file has no record by design; it is not
+// reported missing here so fileStatusOf still answers it from its
+// readable in-memory node.
+//
+// The caller must only call it with a non-nil cache.
+func statusProbeHasNoRecord(vfsInstance *VFS, cachePath string) bool {
+	if _, found := vfsInstance.cache.ProbeSnapshot(cachePath); found {
+		return false
+	}
+	_, isMeta := vfsInstance.isMetadataFile(cachePath)
+	return !isMeta
+}
+
+// errUnaccountable reports that the mount holds no current listing of
+// the path's parent, so existence cannot be established from local
+// listings alone per FR-012/FR-033.
+var errUnaccountable = errors.New("parent listing not current")
+
+// dirListingCurrent reports whether d holds a current listing without
+// triggering a remote refresh. It mirrors Dir._age so a status read
+// never lists a directory to establish existence per FR-005/FR-033.
+func dirListingCurrent(d *Dir) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	_, stale := d._age(time.Now())
+	return !stale
+}
+
+// cachedChild returns the named child from the directory's current
+// items without refreshing the listing. No remote call is made.
+func cachedChild(d *Dir, leaf string) (Node, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	node, ok := d.items[leaf]
+	return node, ok
+}
+
+// isPathInMultipleMountPoints checks if a path is inside more than one live mount point,
+// including alias paths preserved for deduplicated mounts.
+func isPathInMultipleMountPoints(path string) bool {
+	mountPointsMu.Lock()
+	displaySnapshot := make([]string, 0, len(mountPoints))
+	for _, mountPoint := range mountPoints {
+		displaySnapshot = append(displaySnapshot, mountPoint)
+	}
+	var aliasSnapshot []string
+	for _, points := range mountAliases {
+		aliasSnapshot = append(aliasSnapshot, points...)
+	}
+	mountPointsMu.Unlock()
+
+	count := 0
+	for _, mountPoint := range displaySnapshot {
+		if mountPoint == "" {
+			continue
+		}
+		cleanMP := filepath.Clean(mountPoint)
+		if isPathInsideMountPoint(path, cleanMP) {
+			count++
+			if count > 1 {
+				return true
+			}
+		}
+	}
+	for _, mountPoint := range aliasSnapshot {
+		if mountPoint == "" {
+			continue
+		}
+		if isPathInsideMountPoint(path, filepath.Clean(mountPoint)) {
+			count++
+			if count > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// walkToEntry walks the VFS tree to find the entry for the given relative path.
+// Returns the node, its parent directory, and any error.
+//
+// The first level may refresh the root listing (dir.stat) so a mount
+// whose root has never been listed can still answer its top-level
+// entries; deeper levels use only current local listings. A missing
+// entry in a current listing is ENOENT (not_found); a path whose
+// parent has no current listing is errUnaccountable. No remote
+// NewObject or listing-refresh call is made below the root per
+// FR-002/FR-005/FR-012/FR-033.
+func walkToEntry(root *Dir, relPath string) (Node, *Dir, error) {
+	if relPath == "" || relPath == "." {
+		return root, nil, nil // Root directory
+	}
+
+	segments := strings.Split(relPath, string(filepath.Separator))
+	var node Node = root
+	var parentDir *Dir
+
+	for i, segment := range segments {
+		dir, ok := node.(*Dir)
+		if !ok {
+			// Not a directory, can't traverse further
+			return nil, parentDir, errUnaccountable
+		}
+		parentDir = dir
+		var child Node
+		if i == 0 {
+			var err error
+			child, err = dir.stat(segment)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, parentDir, ENOENT
+				}
+				return nil, parentDir, err
+			}
+		} else {
+			if !dirListingCurrent(dir) {
+				return nil, parentDir, errUnaccountable
+			}
+			var found bool
+			child, found = cachedChild(dir, segment)
+			if !found {
+				return nil, parentDir, ENOENT
+			}
+		}
+		node = child
+		// If this is the last segment, we found the entry
+		if i == len(segments)-1 {
+			return node, parentDir, nil
+		}
+	}
+	return node, parentDir, nil
+}
+
+// isSymlink checks if a node is a symlink
+func isSymlink(node Node) bool {
+	if f, ok := node.(*File); ok {
+		return f.IsSymlink()
+	}
+	return false
+}
+
+// buildErrorResult creates a per-path error result.
+func buildErrorResult(path, code, message string) map[string]any {
+	return map[string]any{
+		"path": path,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	}
+}
+
+// buildNonRegularFileResult creates a result for a non-regular file (symlink).
+func buildNonRegularFileResult(vfsInstance *VFS, path string) map[string]any {
+	cacheOff := vfsInstance.Opt.CacheMode == vfscommon.CacheModeOff
+	status := FileStatus{
+		Local:  FileLocalNotRegularFile,
+		Upload: FileUploadNotApplicable,
+		Bytes: FileByteInfo{
+			TotalKnown: false,
+		},
+		IsDir: false,
+	}
+	if cacheOff {
+		status.Upload = FileUploadNotTracked
+	}
+	return buildStatusResult(path, status, cacheOff)
+}
+
+// buildStatusResult creates a success result from a FileStatus.
+func buildStatusResult(path string, status FileStatus, cacheOff bool) map[string]any {
+	result := status.ToParams()
+	result["path"] = path
+	return result
 }

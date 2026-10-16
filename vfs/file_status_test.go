@@ -506,3 +506,106 @@ func TestFileStatusAuth(t *testing.T) {
 		assert.NotEqual(t, http.StatusUnauthorized, resp.StatusCode)
 	})
 }
+
+// fileStatusWholeRequestCase is the generatable request of
+// TestFileStatusWholeRequestDeliveryProperty: the paths array of the
+// request, whether it carries an fs identifier, whether that
+// identifier matches no running mount, and whether the paths array
+// carries a non-string entry.
+type fileStatusWholeRequestCase struct {
+	Paths       []string
+	HasFs       bool
+	UnmatchedFs bool
+	NonString   bool
+}
+
+// fileStatusWholeRequestCode is the reference classifier of the
+// whole-request decision order of FR-006 over a generated case,
+// mirroring the order of the checks in rcFileStatus (vfs/rc.go). It
+// returns the error code of the whole-request rejection, or "" when
+// the request is answered per path.
+func fileStatusWholeRequestCode(c fileStatusWholeRequestCase) string {
+	if c.NonString {
+		return "param_invalid"
+	}
+	if len(c.Paths) == 0 {
+		return "empty_path"
+	}
+	for _, path := range c.Paths {
+		if !filepath.IsAbs(filepath.Clean(path)) {
+			return "empty_path"
+		}
+	}
+	if c.HasFs && c.UnmatchedFs {
+		return "no_active_mount"
+	}
+	if !c.HasFs && len(c.Paths) > 1 {
+		return "ambiguous_mount"
+	}
+	return ""
+}
+
+// TestFileStatusWholeRequestDeliveryProperty is the property test of
+// the whole-request delivery of FR-006: over arbitrary parameter
+// combinations the endpoint either rejects the whole request with the
+// typed *rc.FileStatusError the order above predicts — a non-empty
+// message, status 400 and the Render shape rc.Params{"error": {"code",
+// "message"}} with no path key, top-level or nested — and returns no
+// output, or it answers the request and returns a "statuses" array
+// carrying exactly one entry per requested path.
+func TestFileStatusWholeRequestDeliveryProperty(t *testing.T) {
+	r, _, call := rcNewRun(t, "vfs/file-status")
+	fsName := fs.ConfigString(r.Fremote)
+
+	check := func(c fileStatusWholeRequestCase) bool {
+		in := rc.Params{}
+		if c.NonString {
+			in["paths"] = []any{"/file.txt", 42}
+		} else {
+			in["paths"] = c.Paths
+		}
+		if c.HasFs {
+			if c.UnmatchedFs {
+				in["fs"] = "no-such-mount"
+			} else {
+				in["fs"] = fsName
+			}
+		}
+
+		out, err := call.Fn(context.Background(), in)
+		expected := fileStatusWholeRequestCode(c)
+
+		if expected != "" {
+			if err == nil || out != nil {
+				t.Errorf("case %+v: want whole-request %q rejection with no output, got err=%v out=%v", c, expected, err, out)
+				return false
+			}
+			requireWholeRequestRejection(t, err, expected)
+			return true
+		}
+
+		if err != nil || out == nil {
+			t.Errorf("case %+v: want per-path answer, got err=%v out=%v", c, err, out)
+			return false
+		}
+		var count int
+		switch statuses := out["statuses"].(type) {
+		case []any:
+			count = len(statuses)
+		case []map[string]any:
+			count = len(statuses)
+		default:
+			t.Errorf("case %+v: statuses is not an array: %T", c, out["statuses"])
+			return false
+		}
+		if count != len(c.Paths) {
+			t.Errorf("case %+v: want %d statuses, got %d", c, len(c.Paths), count)
+			return false
+		}
+		return true
+	}
+
+	if err := quick.Check(check, &quick.Config{MaxCount: 100}); err != nil {
+		t.Error(err)
+	}
+}

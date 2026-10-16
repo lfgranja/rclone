@@ -46,6 +46,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -1167,4 +1168,49 @@ func TestFileStatusPerfConcurrentOracleUnderLoad(t *testing.T) {
 		require.True(t, proof.waitForChunkAfter(windowStart, 10*time.Second),
 			"no transfer chunk inside the oracle window and none followed: the transfer was not in flight")
 	}
+}
+
+// TestFileStatusHarnessStructureProperty pins the SC-010
+// harness's initialization structure rather than timing
+// anything: the warm-up and concurrency constants are
+// internally consistent, and fileStatusBarrierReadsErr
+// really issues the requested number of reads, records
+// every start and end instant, and peaks at exactly n
+// simultaneous in-flight slots. The peak is n, not a
+// fraction of it, because every read holds its in-flight
+// slot until all n reads have started, so no read
+// releases its slot before the last read has taken one;
+// the read driver is a no-op and no transfer, reset or
+// cache is involved.
+func TestFileStatusHarnessStructureProperty(t *testing.T) {
+	// The constants must describe a runnable measurement:
+	// the floor inside the per-run discard budget, the
+	// discard inside the calibration budget, no more
+	// required-concurrent reads than one run issues, at
+	// least one run, and the ceiling at Nielsen's 0.1 s.
+	require.LessOrEqual(t, fileStatusWarmupFloor, fileStatusWarmupDiscard,
+		"warm-up floor exceeds the per-run discard budget")
+	require.LessOrEqual(t, fileStatusWarmupDiscard, fileStatusWarmupBudget,
+		"per-run discard budget exceeds the calibration budget")
+	require.LessOrEqual(t, fileStatusMinConcurrentReads, fileStatusReadsPerRun,
+		"required concurrent reads exceed the reads one run issues")
+	require.GreaterOrEqual(t, fileStatusDefaultRuns, 1,
+		"a measurement must perform at least one run")
+	assert.Equal(t, 100*time.Millisecond, fileStatusLatencyCeiling,
+		"the latency ceiling is Nielsen's 0.1 s rule")
+
+	prop := func(raw int8) bool {
+		n := int(raw)
+		if n < 0 {
+			n = -n
+		}
+		n = n%fileStatusReadsPerRun + 1
+		max, starts, ends, maxInflight, _, err := fileStatusBarrierReadsErr(n, func() error { return nil }, nil)
+		return err == nil &&
+			len(starts) == n &&
+			len(ends) == n &&
+			max >= 0 &&
+			maxInflight == int64(n)
+	}
+	require.NoError(t, quick.Check(prop, &quick.Config{MaxCount: 50}))
 }

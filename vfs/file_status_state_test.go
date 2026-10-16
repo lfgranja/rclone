@@ -431,7 +431,9 @@ func fileStatusExitCodeForCode(code string) int {
 //     and, when total_size is known, unbroken_run < total_size and
 //     total_held <= total_size
 //   - download_failed: 0 <= unbroken_run <= total_held <=
-//     total_size
+//     total_size, or 0 <= unbroken_run <= total_held with
+//     total_size not_determinable where the size is unknown
+//     (FR-028, FR-002)
 //   - underivable: both held quantities carry
 //     not_determinable
 //   - not_regular_file: all three carry not_measurable
@@ -503,11 +505,24 @@ func checkFileStatusByteInvariants(local string, unbrokenRun, totalHeld, totalSi
 			return fmt.Errorf("partly_held reports total_held %d > total_size %d", totalHeld.Number, totalSize.Number)
 		}
 	case statusDownloadFailed:
-		if !unbrokenRun.IsNumber || !totalHeld.IsNumber || !totalSize.IsNumber {
-			return fmt.Errorf("download_failed reports a quantity as a marker")
+		if !unbrokenRun.IsNumber || !totalHeld.IsNumber {
+			return fmt.Errorf("download_failed reports a held quantity as a marker")
 		}
-		if unbrokenRun.Number < 0 || totalHeld.Number < unbrokenRun.Number || totalSize.Number < totalHeld.Number {
-			return fmt.Errorf("download_failed reports unbroken_run %d, total_held %d, total_size %d, want 0 <= unbroken_run <= total_held <= total_size", unbrokenRun.Number, totalHeld.Number, totalSize.Number)
+		if unbrokenRun.Number < 0 || totalHeld.Number < unbrokenRun.Number {
+			return fmt.Errorf("download_failed reports unbroken_run %d, total_held %d, want 0 <= unbroken_run <= total_held", unbrokenRun.Number, totalHeld.Number)
+		}
+		if totalSize.Marker == markerNotDeterminable {
+			// A failed download of a file whose total size is unknown
+			// keeps the held quantities against a not_determinable
+			// total_size; the size bound cannot be checked without a
+			// size (FR-028, FR-002).
+			return nil
+		}
+		if !totalSize.IsNumber {
+			return fmt.Errorf("download_failed reports total_size as the marker %q", totalSize.Marker)
+		}
+		if totalSize.Number < totalHeld.Number {
+			return fmt.Errorf("download_failed reports total_held %d > total_size %d", totalHeld.Number, totalSize.Number)
 		}
 	case statusUnderivable:
 		if unbrokenRun.Marker != markerNotDeterminable || totalHeld.Marker != markerNotDeterminable {
@@ -1978,7 +1993,7 @@ func TestFileStatusStateByteInvariantsProperty(t *testing.T) {
 		{statusDownloadFailed, quantity(0), quantity(0), quantity(1024), false},
 		{statusDownloadFailed, quantity(512), quantity(512), quantity(1024), false},
 		{statusDownloadFailed, quantity(512), quantity(256), quantity(1024), true},
-		{statusDownloadFailed, quantity(512), quantity(512), determinable, true},
+		{statusDownloadFailed, quantity(512), quantity(512), determinable, false},
 		// A value of either fact is not a marker of any
 		// quantity, and a marker is not a value of either
 		// fact.

@@ -1032,11 +1032,11 @@ func resolveVFSForPath(path string) (*VFS, string, string) {
 	// Resolve parent links without following the final component so
 	// an alias parent still selects its target mount; a dangling
 	// parent names nothing reachable (outside).
-	if resolved, ok := resolvePathForMatching(cleanPath); !ok {
+	resolved, ok := resolvePathForMatching(cleanPath)
+	if !ok {
 		return nil, "", ""
-	} else {
-		cleanPath = resolved
 	}
+	cleanPath = resolved
 	// Collect every live candidate: display points resolve through
 	// their indexed names, aliases carry their VFS and point directly.
 	type candidate struct {
@@ -1280,11 +1280,9 @@ func classifyPath(vfsInstance *VFS, vfsName, mountPoint, path string, hasFsParam
 	cleanMP := filepath.Clean(mountPoint)
 	cleanPath := filepath.Clean(path)
 	// Resolve parent links for mount matching; a dangling parent is outside.
-	resolvedPath := cleanPath
-	if resolved, ok := resolvePathForMatching(cleanPath); !ok {
+	resolvedPath, ok := resolvePathForMatching(cleanPath)
+	if !ok {
 		return buildErrorResult(path, "outside_any_mount", "parent link target does not exist")
-	} else {
-		resolvedPath = resolved
 	}
 
 	if !isPathInsideMountPoint(resolvedPath, cleanMP) {

@@ -11,6 +11,8 @@ rclone.iml
 .history
 .vscode
 *.test
+*.out
+vendor/
 *.iml
 fuzz-build.zip
 *.orig
@@ -20,3 +22,4 @@ __pycache__
 .DS_Store
 resource_windows_*.syso
 .devcontainer
+graphify-out/

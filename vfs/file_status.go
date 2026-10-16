@@ -47,12 +47,10 @@ func fileStatusOf(v *VFS, cachePath string, isLink, cacheOff bool) FileStatus {
 	// total_size known from the directory entry the mount holds, and
 	// the upload fact is the mount-level guard not_tracked.
 	if cacheOff {
+		// The total size is not derived from a remote lookup
+		// (FR-005): a status read makes no network activity. Where
+		// the mount has no local record the size is not known here.
 		size := int64(-1)
-		// Best-effort size from the remote; if unavailable the
-		// byte info will carry not_determinable for total_size.
-		if o, err := v.f.NewObject(v.ctx, cachePath); err == nil && o != nil {
-			size = o.Size()
-		}
 		return FileStatus{
 			Local:  FileLocalNotHeld,
 			Upload: FileUploadNotTracked,
@@ -78,10 +76,10 @@ func fileStatusOf(v *VFS, cachePath string, isLink, cacheOff bool) FileStatus {
 		if status, found := fileStatusMetadata(v, cachePath); found {
 			return status
 		}
+		// The total size is not derived from a remote lookup
+		// (FR-005): a status read makes no network activity. Where
+		// the mount has no local record the size is not known here.
 		size := int64(-1)
-		if o, err := v.f.NewObject(v.ctx, cachePath); err == nil && o != nil {
-			size = o.Size()
-		}
 		return FileStatus{
 			Local:  FileLocalNotHeld,
 			Upload: FileUploadNotApplicable, // never written through this mount

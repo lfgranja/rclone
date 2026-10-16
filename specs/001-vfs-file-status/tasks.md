@@ -301,3 +301,7 @@ Property-based gaps from subagent (`ses_ebe1ed26effeDneM4UCHkyHe20`): T011 whole
 - [ ] T105 **LOW** Add `testing/quick` property for SC-010 harness structure (T016): assert harness parameters (discard-first-20 >=5-floor, independent concurrent reads, per-run max <=100ms, reset window) compile and initialize correctly; file `vfs/file_status_perf_test.go`
 
 **Verification attestation (Constitution IV)**: T103 is blocking. Only after T103 + T098 (SC formal records) + T092 (Phase 6 replay) can full attestation stand. Do not claim convergence until T103 is resolved and command outputs recorded.
+
+## Phase 12: Convergence
+
+- [ ] T106 Fix download-failed classification when total size is unknown per FR-028/FR-002 (contradicts): `vfs/file_status.go` (`fileStatusFromSnapshot`) currently requires `totalKnown` before reporting `download_failed`, so a failed download of a file whose size is unknown falls through to `partly_held`/`not_held`. Drop the `&& totalKnown` guard so `snap.DownloadErr != nil` alone selects `FileLocalDownloadFailed`, keeping the held bytes and unbroken run and marking `total_size` `not_determinable` where unknown. Add fault-injected test coverage (unknown total size, with and without partial cache) before the change per R1. Affected tests: `vfs/file_status_state_test.go` byte-invariant checks; counts-as remote additions must stay zero. Fixed code: `vfs/file_status.go`. Depends on existing T067/T072 coverage.

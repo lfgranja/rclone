@@ -7,12 +7,15 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/lib/ranges"
+	"github.com/rclone/rclone/vfs/vfscache"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -545,4 +548,133 @@ func TestFileStatusMultipleOutstandingUploads(t *testing.T) {
 		requireFileStatusFailureByte(t, status, "total_size", int64(len(test.content)))
 	}
 	assert.Zero(t, fixture.control.uploadAttemptCount())
+}
+
+// TestFileStatusStateDownloadFailedUnknownTotalSize pins the FR-028/FR-002
+// interaction for a failed download of a file whose total size the mount does
+// not know: the local fact is still the failure value download_failed — not
+// partly_held and not not_held — while total_size renders the
+// not_determinable marker and the two held quantities keep describing the
+// bytes that did arrive (0 <= unbroken_run <= total_held). The known-total
+// case is the control that already held before this rule.
+func TestFileStatusStateDownloadFailedUnknownTotalSize(t *testing.T) {
+	injected := errors.New("injected download failure")
+
+	t.Run("unknown total, partial cache", func(t *testing.T) {
+		snap := vfscache.ItemSnapshot{
+			Size:        -1,
+			Rs:          ranges.Ranges{{Pos: 0, Size: 7}},
+			DownloadErr: injected,
+		}
+		status := fileStatusFromSnapshot(nil, snap)
+		assert.Equal(t, FileLocalDownloadFailed, status.Local)
+
+		bytes, ok := status.ToParams()["bytes"].(rc.Params)
+		require.True(t, ok, "bytes is not rc.Params: %v", status.ToParams()["bytes"])
+		assert.Equal(t, int64(7), bytes["unbroken_run"])
+		assert.Equal(t, int64(7), bytes["total_held"])
+		assert.Equal(t, fileStatusMarkerNotDeterminable, bytes["total_size"])
+	})
+
+	t.Run("unknown total, no cache", func(t *testing.T) {
+		snap := vfscache.ItemSnapshot{
+			Size:        -1,
+			Rs:          nil,
+			DownloadErr: injected,
+		}
+		status := fileStatusFromSnapshot(nil, snap)
+		assert.Equal(t, FileLocalDownloadFailed, status.Local)
+
+		bytes, ok := status.ToParams()["bytes"].(rc.Params)
+		require.True(t, ok, "bytes is not rc.Params: %v", status.ToParams()["bytes"])
+		assert.Equal(t, int64(0), bytes["unbroken_run"])
+		assert.Equal(t, int64(0), bytes["total_held"])
+		assert.Equal(t, fileStatusMarkerNotDeterminable, bytes["total_size"])
+	})
+
+	t.Run("known total, partial cache (control)", func(t *testing.T) {
+		snap := vfscache.ItemSnapshot{
+			Size:        10,
+			Rs:          ranges.Ranges{{Pos: 0, Size: 7}},
+			DownloadErr: injected,
+		}
+		status := fileStatusFromSnapshot(nil, snap)
+		assert.Equal(t, FileLocalDownloadFailed, status.Local)
+
+		bytes, ok := status.ToParams()["bytes"].(rc.Params)
+		require.True(t, ok, "bytes is not rc.Params: %v", status.ToParams()["bytes"])
+		assert.Equal(t, int64(7), bytes["unbroken_run"])
+		assert.Equal(t, int64(7), bytes["total_held"])
+		assert.Equal(t, int64(10), bytes["total_size"])
+	})
+}
+
+// TestFileStatusStateDownloadFailedUnknownSizeProperty checks the same
+// FR-028/FR-002 rule over generated snapshots: any failed download of a file
+// with bytes to be present reports download_failed, and where the total size
+// is unknown the rendered total_size is the not_determinable marker while the
+// two held quantities stay numbers in the chain 0 <= unbroken_run <=
+// total_held. Generated sizes and ranges are clamped into the domain of
+// interest: sizes in {-1} ∪ [0,64], and a single range whose start and length
+// are in [0,64].
+func TestFileStatusStateDownloadFailedUnknownSizeProperty(t *testing.T) {
+	injected := errors.New("injected download failure")
+	clamp := func(value int64) int64 {
+		value %= 65
+		if value < 0 {
+			value = -value
+		}
+		return value
+	}
+	property := func(rawSize, rawStart, rawLength int64) bool {
+		// A negative generated size stands for an unknown total; the
+		// rest clamp into [0,64].
+		size := int64(-1)
+		if rawSize >= 0 {
+			size = clamp(rawSize)
+		}
+		start := clamp(rawStart)
+		length := clamp(rawLength)
+		var rs ranges.Ranges
+		if length > 0 {
+			rs = ranges.Ranges{{Pos: start, Size: length}}
+		}
+		snap := vfscache.ItemSnapshot{
+			Size:        size,
+			Rs:          rs,
+			DownloadErr: injected,
+		}
+		status := fileStatusFromSnapshot(nil, snap)
+
+		// A file with bytes to be present reports the failure value.
+		if size != 0 && status.Local != FileLocalDownloadFailed {
+			return false
+		}
+		if size >= 0 {
+			return true
+		}
+
+		// Unknown total: total_size is not_determinable while both held
+		// quantities stay numbers in the chain 0 <= unbroken <= total.
+		bytes, ok := status.ToParams()["bytes"].(rc.Params)
+		if !ok {
+			return false
+		}
+		marker, ok := bytes["total_size"].(string)
+		if !ok || marker != fileStatusMarkerNotDeterminable {
+			return false
+		}
+		unbrokenRun, ok := bytes["unbroken_run"].(int64)
+		if !ok {
+			return false
+		}
+		totalHeld, ok := bytes["total_held"].(int64)
+		if !ok {
+			return false
+		}
+		return unbrokenRun >= 0 && unbrokenRun <= totalHeld
+	}
+	if err := quick.Check(property, nil); err != nil {
+		t.Error(err)
+	}
 }

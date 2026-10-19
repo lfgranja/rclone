@@ -271,9 +271,15 @@ func TestRcList(t *testing.T) {
 	out, err := call.Fn(context.Background(), nil)
 	require.NoError(t, err)
 
+	// vfs/list keeps its vfses array byte-for-byte unchanged
+	// and gains a mountPoints key beside it. Null here
+	// because an in-process test VFS has no host mount point.
 	assert.Equal(t, rc.Params{
 		"vfses": []string{
 			fs.ConfigString(r.Fremote),
+		},
+		"mountPoints": map[string]any{
+			fs.ConfigString(r.Fremote): nil,
 		},
 	}, out)
 }

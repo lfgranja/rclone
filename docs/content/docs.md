@@ -3441,6 +3441,85 @@ it will log a high priority message if the retry was successful.
 - `9` - Operation successful, but no files transferred (Requires
   [`--error-on-no-transfer`](#error-on-no-transfer))
 - `10` - Duration exceeded - limit set by --max-duration reached
+- `11` - Not fully held locally - file is not fully cached locally, and the mount keeps a cache
+- `12` - Upload not complete - upload outstanding, failed, or not tracked
+
+### Exit codes 11 and 12: `rclone vfs status`
+
+Exit codes `11` and `12` belong to `rclone vfs status`, which asks a
+running mount about one named file: whether the file is held in the
+local cache and whether its content has reached the remote. The
+reported JSON object always carries both facts, so a caller that needs
+the fact the exit status did not name never has to ask twice.
+
+The mapping, in numeric order:
+
+- `0` - the file is fully held locally and its upload fact is
+  `uploaded` or `not_applicable` (the mount never wrote the file, so
+  its content is already on the remote).
+- `1` - the query could not be answered at all: no active mount, an
+  ambiguous mount, a path outside any mount, a directory named as a
+  file, a path that does not exist, or a mount whose control interface
+  is unreachable. A directory and a missing path take `1`, not `3`
+  or `4`, so no number carries two meanings.
+- `2` - the invocation itself was wrong: no path given, an empty path,
+  or more than one path. The command answers for one path per
+  invocation.
+- `11` - the file is not fully held locally and the mount keeps a
+  cache. This status takes precedence over `12`: a file that is both
+  partly held and awaiting upload exits `11`, with the upload fact
+  still present in the output. A failed download also exits `11`,
+  since it is a value of the local fact.
+- `12` - the upload is not complete: `awaiting_upload`, `uploading`,
+  `upload_failed`, or `not_tracked`. A failed upload exits `12`,
+  never `1`, because the query was answered.
+
+Cache-off exception: on a mount that keeps no cache at all, no file is
+ever fully held, so the precedence above would leave `12` unreachable.
+Such mounts therefore report the upload fact instead: every file whose
+local fact is a content value (`fully_held`, `partly_held`, `not_held`,
+`download_failed`, `underivable`) takes `12`, and none of them exits
+`0`. A non-regular file keeps `11` even there, since its local fact
+says nothing about held content.
+
+Unknown-value tolerance: the reported states and error codes are stable
+in meaning but not closed in number. A later release may add values,
+and a consumer must tolerate a value it does not recognise - for
+example by falling back to a non-failing default - rather than treat
+the published set as exhaustive. A recognised value keeps its
+documented meaning. The message text beside an error code is for people,
+not programs: never branch on it.
+
+Known limitations of `rclone vfs status`:
+
+- Caller pacing: the interface never throttles, delays, or batches
+  reads; a consumer issuing reads in a tight loop paces itself. A read
+  still never waits on a transfer of the file.
+- Enumeration deferred: there is no listing of which files a mount
+  holds. The caller names the paths it cares about, one per invocation.
+- Grace period: keeping a closed file's cache entry alive so that
+  reopening is cheap changes nothing reported. An entry removed by
+  eviction or reset reads as not held, exactly like one never cached.
+- Mount-lifetime failures: a failed download or upload is reported only
+  while the mount that recorded it keeps running, and only for a
+  failure the mount recorded - never inferred from a missing entry or
+  an empty queue. After a restart the file reads as awaiting upload.
+- No unreadable-path code: the mount never learns the caller's identity
+  or permissions. Filesystem paths the user may not open are refused by
+  the kernel before the mount is asked; over this interface the caller
+  is whoever can reach the mount's control interface.
+- No upload progress: how much of an in-flight upload has transferred
+  is not reported.
+- Null mount point: a VFS created without a mount point reports null
+  for it, and no caller path resolves to it.
+- Queue superseded but unchanged: for a named path the per-file upload
+  fact is the authoritative answer, covering files the upload queue
+  cannot describe (finished, failed, untracked); the queue's own
+  behaviour is unchanged.
+- Shared-config asymmetry: two mounts on one config name are told apart
+  here by the indexed names `vfs/list` reports, while the sibling mount
+  commands still resolve the bare config name and refuse a shared one
+  as ambiguous.
 
 ## Environment variables
 

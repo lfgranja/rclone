@@ -472,6 +472,15 @@ func (wb *WriteBack) Stats() (uploadsInProgress, uploadsQueued int) {
 	return wb.uploads, len(wb.items)
 }
 
+// IsUploading returns true if the item with the given handle is
+// currently being uploaded.
+func (wb *WriteBack) IsUploading(id Handle) bool {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	wbItem, ok := wb.lookup[id]
+	return ok && wbItem.uploading
+}
+
 // QueueInfo is information about an item queued for upload, returned
 // by Queue
 type QueueInfo struct {

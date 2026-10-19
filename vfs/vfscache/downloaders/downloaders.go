@@ -446,6 +446,15 @@ func (dls *Downloaders) kickWaiters() (err error) {
 	return nil
 }
 
+// GetError returns the accumulated error count and last error
+// from the downloaders. Used for status reporting to detect
+// download failures.
+func (dls *Downloaders) GetError() (errorCount int, lastErr error) {
+	dls.mu.Lock()
+	defer dls.mu.Unlock()
+	return dls.errorCount, dls.lastErr
+}
+
 // Write writes len(p) bytes from p to the underlying data stream. It
 // returns the number of bytes written from p (0 <= n <= len(p)) and
 // any error encountered that caused the write to stop early. Write

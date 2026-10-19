@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "empty_path",
+    "message": "paths is empty or an entry is not absolute"
+  }
+}

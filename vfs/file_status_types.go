@@ -9,26 +9,24 @@ import "github.com/rclone/rclone/fs/rc"
 // fact's value only as that fact's value.
 const (
 	fileStatusMarkerNotDeterminable = "not_determinable"
-	fileStatusMarkerNotMeasurable = "not_measurable"
+	fileStatusMarkerNotMeasurable   = "not_measurable"
 )
 
-// The exit statuses publishes for a result that
+// The exit statuses the endpoint publishes for a result that
 // reports a state: success, not fully held locally and
 // upload not complete. The usage error (2) and the query
 // failure (1) belong to failures to answer the query at
 // all, which the endpoint reports as errors rather than
 // as states, so no FileStatus maps to them.
 const (
-	fileStatusExitSuccess = 0
-	fileStatusExitNotFullyHeld = 11
+	fileStatusExitSuccess           = 0
+	fileStatusExitNotFullyHeld      = 11
 	fileStatusExitUploadNotComplete = 12
 )
 
 // FileLocalState is the local-cache fact of a file: how
-// much of the file the mount holds locally (,
-//). Each value is published with its exact wire
-// spelling in "State Value Definitions",
-// and describes one observation instant.
+// much of the file the mount holds locally. Each value is published with its exact wire
+// spelling, and describes one observation instant.
 type FileLocalState string
 
 // The values of the local-cache fact.
@@ -90,19 +88,17 @@ const (
 	// for upload on a mount that does track uploads, such
 	// as one never written through the mount. It is a
 	// mount-level guard, never a per-file observation, and
-	// is mutually exclusive with every per-file value
-	//.
+	// is mutually exclusive with every per-file value.
 	FileUploadNotApplicable FileUploadState = "not_applicable"
 	// FileUploadNotTracked reports a mount that keeps no
 	// cache at all and so has no upload queue. It is a
 	// mount-level guard, reported for every file on such a
-	// mount and never on one that keeps a cache (,
-	//).
+	// mount and never on one that keeps a cache.
 	FileUploadNotTracked FileUploadState = "not_tracked"
 )
 
 // FileByteInfo is the three byte quantities of a file's
-// report (,a): the unbroken run of held
+// report: the unbroken run of held
 // bytes from offset zero, the total bytes held anywhere in
 // the file, and the file's total size. Each quantity is a
 // measurement, 0 included, or an explicit marker; a
@@ -132,13 +128,11 @@ type FileByteInfo struct {
 }
 
 // FileStatus is the report of one path the mount could
-// answer: both facts of, the byte quantities of
-//, and whether the path names a directory, all
+// answer: both facts, the byte quantities, and whether the path names a directory, all
 // describing one observation instant. A path the mount
 // cannot answer — a directory, an absent entry, a path
 // outside the mount — is not a FileStatus; it is an
-// error result, which the endpoint reports separately
-//.
+// error result, which the endpoint reports separately.
 type FileStatus struct {
 	// Local is the local-cache fact of the file.
 	Local FileLocalState
@@ -155,7 +149,7 @@ type FileStatus struct {
 // ToParams returns the per-path state result of the
 // contract: the local fact, the upload fact and the bytes
 // object, under the "local", "upload" and "bytes" keys
-//. The caller adds
+// for the response format. The caller adds
 // the "path" key; error results carry an "error" object
 // instead and are built separately. The byte quantities
 // carry their markers where the local fact fixes them —
@@ -165,7 +159,7 @@ type FileStatus struct {
 // carries not_determinable where the mount does not know
 // the file's size, so a consumer reads one object shape
 // whatever the state.
-func (s FileStatus) ToParams rc.Params {
+func (s FileStatus) ToParams() rc.Params {
 	var unbrokenRun, totalHeld, totalSize any
 	switch s.Local {
 	case FileLocalNotRegularFile:
@@ -183,19 +177,19 @@ func (s FileStatus) ToParams rc.Params {
 		// measurement wherever the mount knows it.
 		unbrokenRun = fileStatusMarkerNotDeterminable
 		totalHeld = fileStatusMarkerNotDeterminable
-		totalSize = s.totalSize
+		totalSize = s.totalSize()
 	default:
 		unbrokenRun = s.Bytes.UnbrokenRun
 		totalHeld = s.Bytes.TotalHeld
-		totalSize = s.totalSize
+		totalSize = s.totalSize()
 	}
 	return rc.Params{
-		"local": s.Local,
+		"local":  s.Local,
 		"upload": s.Upload,
 		"bytes": rc.Params{
 			"unbroken_run": unbrokenRun,
-			"total_held": totalHeld,
-			"total_size": totalSize,
+			"total_held":   totalHeld,
+			"total_size":   totalSize,
 		},
 	}
 }
@@ -205,14 +199,14 @@ func (s FileStatus) ToParams rc.Params {
 // not_determinable marker where it does not, so a caller
 // can tell an empty file from a size the mount cannot
 // supply.
-func (s FileStatus) totalSize any {
+func (s FileStatus) totalSize() any {
 	if !s.Bytes.TotalKnown {
 		return fileStatusMarkerNotDeterminable
 	}
 	return s.Bytes.TotalSize
 }
 
-// ExitCode returns the exit status maps a reported
+// ExitCode returns the exit status the endpoint maps a reported
 // state to, so a script can branch without parsing the
 // output. A file reported as fully held locally whose
 // upload fact is uploaded or not_applicable is success,
@@ -228,8 +222,7 @@ func (s FileStatus) totalSize any {
 // every file whose local fact is a content value takes the
 // upload-not-complete status, while a non-regular file
 // keeps the not-fully-held-locally status, its local fact
-// asserting nothing about held content (,,
-//).
+// asserting nothing about held content.
 //
 // Failures to answer the query at all — a directory, an
 // absent entry, a path outside the mount, an unreachable

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -577,4 +579,93 @@ func rcQueueSetExpiry(ctx context.Context, in rc.Params) (out rc.Params, err err
 	}
 	err = vfs.cache.QueueSetExpiry(writeback.Handle(id), refTime, time.Duration(float64(time.Second)*expiry))
 	return nil, err
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:   "vfs/file-status",
+		NoAuth: true,
+		Title:  "Report the cache and transfer state of files on a VFS mount.",
+		Help: `
+This reports, for each path in the "paths" parameter, whether
+the file is held in the local cache and the state of its
+upload to the remote.
+
+It takes an optional "fs" parameter naming the mount and a
+"paths" parameter holding the absolute file paths to report on,
+e.g.
+
+    rclone rc vfs/file-status --json '{"fs":"mydrive","paths":["/mnt/mydrive/file.txt"]}'
+
+If "fs" is omitted and a single path is supplied, the mount is
+resolved from the registered mount point containing the path.
+If multiple paths are supplied, "fs" must be provided.
+
+It returns the report under the key "statuses" where each
+element carries "path" and either an "error" object or:
+
+- "local": one of "fully_held", "partly_held", "not_held",
+  "download_failed", "underivable", or "not_regular_file"
+- "upload": one of "uploaded", "awaiting_upload", "uploading",
+  "upload_failed", "not_applicable", or "not_tracked"
+- "bytes": object with "unbroken_run", "total_held", and
+  "total_size" (numbers or "not_determinable"/"not_measurable")
+
+Local cache residency and remote upload state are reported
+independently so callers can distinguish, for example, a file
+that is fully held locally while still awaiting upload or
+experiencing an upload failure.`,
+		Fn: rcFileStatus,
+	})
+}
+
+// rcFileStatus reports the local cache and upload state of the
+// files named in the "paths" parameter.
+func rcFileStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	pathsRaw, ok := in["paths"]
+	if !ok {
+		return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", http.StatusBadRequest)
+	}
+
+	var rawEntries []any
+	switch v := pathsRaw.(type) {
+	case []any:
+		rawEntries = v
+	case []string:
+		rawEntries = make([]any, len(v))
+		for i, s := range v {
+			rawEntries[i] = s
+		}
+	default:
+		return nil, rc.NewFileStatusError("param_invalid", "paths must be an array", http.StatusBadRequest)
+	}
+
+	if len(rawEntries) == 0 {
+		return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", http.StatusBadRequest)
+	}
+
+	cleanedPaths := make([]string, len(rawEntries))
+	for i, entry := range rawEntries {
+		s, ok := entry.(string)
+		if !ok {
+			return nil, rc.NewFileStatusError("param_invalid", "paths entries must be strings", http.StatusBadRequest)
+		}
+		cleaned := filepath.Clean(s)
+		if !filepath.IsAbs(cleaned) {
+			return nil, rc.NewFileStatusError("empty_path", "paths is empty or an entry is not absolute", http.StatusBadRequest)
+		}
+		cleanedPaths[i] = cleaned
+	}
+
+	statuses := make([]rc.Params, 0, len(cleanedPaths))
+	for _, cleaned := range cleanedPaths {
+		statuses = append(statuses, rc.Params{
+			"path": cleaned,
+			"error": rc.Params{
+				"code":    "outside_any_mount",
+				"message": fmt.Sprintf("path %q does not lie inside any active VFS mount point", cleaned),
+			},
+		})
+	}
+	return rc.Params{"statuses": statuses}, nil
 }

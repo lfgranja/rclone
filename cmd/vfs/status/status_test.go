@@ -2,6 +2,7 @@ package status
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -14,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"testing/quick"
 	"time"
@@ -826,7 +826,7 @@ func TestIsTransportLossUsesWrappedErrors(t *testing.T) {
 	dialErr := &neturl.Error{
 		Op:  "Post",
 		URL: "http://localhost:5572/vfs/file-status",
-		Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")},
 	}
 	tests := []struct {
 		name string
@@ -837,8 +837,9 @@ func TestIsTransportLossUsesWrappedErrors(t *testing.T) {
 		{name: "dial failure", err: fmt.Errorf("connection failed: %w", dialErr), want: true},
 		{name: "truncated response body", err: fmt.Errorf("failed to read rc response: %w: %s", io.ErrUnexpectedEOF, ""), want: true},
 		{name: "closed response body", err: fmt.Errorf("failed to read rc response: %w", io.ErrClosedPipe), want: true},
-		{name: "reset connection", err: fmt.Errorf("failed to read rc response: %w", syscall.ECONNRESET), want: true},
+		{name: "reset connection", err: fmt.Errorf("failed to read rc response: %w", &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}), want: true},
 		{name: "text only error", err: fmt.Errorf("connection failed: unexpected EOF"), want: false},
+		{name: "unclassified response read error", err: fmt.Errorf("failed to read rc response: %w", &responseReadError{err: errors.New("malformed chunked encoding")}), want: true},
 		{name: "RC application error", err: fmt.Errorf("operation failed: param_invalid"), want: false},
 	}
 	for _, test := range tests {

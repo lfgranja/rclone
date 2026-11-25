@@ -8,11 +8,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/quick"
 	"time"
@@ -818,4 +820,32 @@ func TestResponseBodyDisconnectMapsToMountUnreachable(t *testing.T) {
 		t.Errorf("mid-response disconnect: exit code = %d, want 1", code)
 	}
 	assertErrorJSON(t, stdout, path, "mount_unreachable")
+}
+
+func TestIsTransportLossUsesWrappedErrors(t *testing.T) {
+	dialErr := &neturl.Error{
+		Op:  "Post",
+		URL: "http://localhost:5572/vfs/file-status",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+	}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "dial failure", err: fmt.Errorf("connection failed: %w", dialErr), want: true},
+		{name: "truncated response body", err: fmt.Errorf("failed to read rc response: %w: %s", io.ErrUnexpectedEOF, ""), want: true},
+		{name: "closed response body", err: fmt.Errorf("failed to read rc response: %w", io.ErrClosedPipe), want: true},
+		{name: "reset connection", err: fmt.Errorf("failed to read rc response: %w", syscall.ECONNRESET), want: true},
+		{name: "text only error", err: fmt.Errorf("connection failed: unexpected EOF"), want: false},
+		{name: "RC application error", err: fmt.Errorf("operation failed: param_invalid"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isTransportLoss(test.err); got != test.want {
+				t.Errorf("isTransportLoss(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
 }

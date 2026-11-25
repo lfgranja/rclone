@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/fs"
@@ -279,7 +282,7 @@ func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err 
 	body, err = io.ReadAll(resp.Body)
 	bodyString = strings.TrimSpace(string(body))
 	if err != nil {
-		return errorf(resp.StatusCode, path, "failed to read rc response: %s: %s", resp.Status, bodyString)
+		return errorf(resp.StatusCode, path, "failed to read rc response: %w: %s", err, bodyString)
 	}
 
 	// Parse output
@@ -299,22 +302,19 @@ func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err 
 
 // isTransportLoss reports whether err is a transport-level failure:
 // the dial itself failed or the response body was lost mid-read.
-// Both map to mount_unreachable.
+// Both map to mount_unreachable. It inspects the wrapped error so
+// changes to wrapper messages do not change the command's classification.
 func isTransportLoss(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "connection failed") {
+	var netErr net.Error
+	if errors.As(err, &netErr) {
 		return true
 	}
-	if strings.Contains(msg, "failed to read rc response") {
-		return true
-	}
-	if strings.Contains(msg, "unexpected EOF") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") {
-		return true
-	}
-	return false
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 // emitJSON writes a single JSON object to stdout.

@@ -37,26 +37,24 @@ func newFileStatusRegistryVFS(t *testing.T, f fs.Fs, opt *vfscommon.Options) (*V
 	}
 }
 
-func fileStatusRegistrySnapshot(t *testing.T, call *rc.Call) ([]string, map[string]any) {
+func fileStatusRegistrySnapshot(t *testing.T, call *rc.Call) []string {
 	t.Helper()
 	out, err := call.Fn(context.Background(), nil)
 	require.NoError(t, err)
 	names, ok := out["vfses"].([]string)
 	require.True(t, ok, "vfs/list must return its vfses array")
-	points, ok := mountPointsObject(out["mountPoints"])
-	require.True(t, ok, "vfs/list must return its mountPoints object")
-	return names, points
+	return names
 }
 
-func fileStatusIdentifierForMountPoint(t *testing.T, names []string, points map[string]any, mountPoint string) string {
+func fileStatusIdentifierForMountPoint(t *testing.T, names []string, mountPoint string) string {
 	t.Helper()
-	for name, value := range points {
-		if value == mountPoint {
+	for name, point := range GetAllMountPoints() {
+		if point == mountPoint {
 			require.Contains(t, names, name, "mount-point keys must be names emitted by vfs/list")
 			return name
 		}
 	}
-	require.FailNow(t, "vfs/list did not report mount point %q", mountPoint)
+	require.FailNow(t, "no registry name for mount point %q", mountPoint)
 	return ""
 }
 
@@ -97,18 +95,9 @@ func TestFileStatusRegistryIndexedNamesAndTeardown(t *testing.T) {
 	mountPoint2 := filepath.Join(t.TempDir(), "mount-two")
 	RegisterMountPointForVFS(vfs1, mountPoint1)
 	RegisterMountPointForVFS(vfs2, mountPoint2)
-	cleanupNames := map[string]struct{}{}
-	for name, point := range GetAllMountPoints() {
-		if point == mountPoint1 || point == mountPoint2 {
-			cleanupNames[name] = struct{}{}
-		}
-	}
 	t.Cleanup(func() {
-		for name := range cleanupNames {
-			UnregisterMountPoint(name)
-		}
-		UnregisterMountPointForVFS(vfs1)
-		UnregisterMountPointForVFS(vfs2)
+		UnregisterMountPointForVFS(vfs1, mountPoint1)
+		UnregisterMountPointForVFS(vfs2, mountPoint2)
 	})
 
 	listCall := rc.Calls.Get("vfs/list")
@@ -116,9 +105,9 @@ func TestFileStatusRegistryIndexedNamesAndTeardown(t *testing.T) {
 	require.NotNil(t, listCall)
 	require.NotNil(t, statusCall)
 
-	names, points := fileStatusRegistrySnapshot(t, listCall)
-	id1 := fileStatusIdentifierForMountPoint(t, names, points, mountPoint1)
-	id2 := fileStatusIdentifierForMountPoint(t, names, points, mountPoint2)
+	names := fileStatusRegistrySnapshot(t, listCall)
+	id1 := fileStatusIdentifierForMountPoint(t, names, mountPoint1)
+	id2 := fileStatusIdentifierForMountPoint(t, names, mountPoint2)
 	assert.NotEqual(t, id1, id2)
 	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint1, ""), "error")
 	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint2, ""), "error")
@@ -130,21 +119,15 @@ func TestFileStatusRegistryIndexedNamesAndTeardown(t *testing.T) {
 
 	// Removing index zero changes the surviving VFS's reported name. Its
 	// registered path must move with it instead of remaining under a stale suffix.
-	UnregisterMountPointForVFS(vfs1)
+	UnregisterMountPointForVFS(vfs1, mountPoint1)
 	shutdown1()
 
-	names, points = fileStatusRegistrySnapshot(t, listCall)
+	names = fileStatusRegistrySnapshot(t, listCall)
 	assert.Contains(t, names, configName)
 	assert.NotContains(t, names, configName+"[1]", "a sole remaining VFS is reported without a stale index")
-	assert.Equal(t, mountPoint2, points[configName], "the surviving mount point must be reindexed with its VFS")
+	assert.Equal(t, mountPoint2, GetMountPoint(configName+"[1]"), "the surviving mount point stays registered after reindexing")
 	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint2, ""), "error")
-	survivorID := ""
-	for name, point := range points {
-		if point == mountPoint2 {
-			survivorID = name
-			break
-		}
-	}
+	survivorID := configName
 	if assert.NotEmpty(t, survivorID, "vfs/list must report the surviving mount point") {
 		result, err = fileStatusRegistryQuery(t, statusCall, mountPoint2, survivorID)
 		assert.NoError(t, err)
@@ -153,7 +136,7 @@ func TestFileStatusRegistryIndexedNamesAndTeardown(t *testing.T) {
 		}
 	}
 
-	UnregisterMountPointForVFS(vfs2)
+	UnregisterMountPointForVFS(vfs2, mountPoint2)
 	shutdown2()
 }
 
@@ -174,26 +157,18 @@ func TestFileStatusRegistryDeduplicatedMountKeepsSingleReportedPoint(t *testing.
 	require.NotNil(t, listCall)
 	require.NotNil(t, statusCall)
 	t.Cleanup(func() {
-		for name, point := range GetAllMountPoints() {
-			if point == mountPoint1 || point == mountPoint2 {
-				UnregisterMountPoint(name)
-			}
-		}
-		UnregisterMountPointForVFS(vfs1)
+		UnregisterMountPointForVFS(vfs1, mountPoint1)
+		UnregisterMountPointForVFS(vfs2, mountPoint2)
 	})
 
-	namesBefore, points := fileStatusRegistrySnapshot(t, listCall)
+	namesBefore := fileStatusRegistrySnapshot(t, listCall)
 	require.Equal(t, []string{configName}, namesBefore)
-	require.Len(t, points, 1)
-	require.Equal(t, mountPoint1, points[configName])
+	require.Equal(t, mountPoint1, GetMountPoint(configName))
 
 	RegisterMountPointForVFS(vfs2, mountPoint2)
-	names, points := fileStatusRegistrySnapshot(t, listCall)
+	names := fileStatusRegistrySnapshot(t, listCall)
 	assert.Equal(t, namesBefore, names, "a deduplicated VFS must not add a vfs/list name")
-	require.Len(t, points, 1, "mountPoints remains one value per reported VFS name")
-	reportedPoint, ok := points[configName].(string)
-	require.True(t, ok, "a mounted VFS reports one mount-point string")
-	assert.Contains(t, []string{mountPoint1, mountPoint2}, reportedPoint)
+	require.Equal(t, mountPoint2, GetMountPoint(configName), "the shared VFS reports one live mount-point string")
 	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint1, ""), "error",
 		"the private registry must retain the first live path")
 	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint2, ""), "error",
@@ -201,23 +176,61 @@ func TestFileStatusRegistryDeduplicatedMountKeepsSingleReportedPoint(t *testing.
 
 	// The second mount releases one reference to the shared VFS. The sole
 	// reported point must be the first mount that is still live.
-	UnregisterMountPointForVFS(vfs2)
+	UnregisterMountPointForVFS(vfs2, mountPoint2)
 	shutdown2()
-	names, points = fileStatusRegistrySnapshot(t, listCall)
+	names = fileStatusRegistrySnapshot(t, listCall)
 	assert.Equal(t, namesBefore, names)
-	require.Len(t, points, 1)
-	assert.Equal(t, mountPoint1, points[configName], "unregistering one shared reference must not leave a stale point")
+	require.Equal(t, mountPoint1, GetMountPoint(configName), "unregistering one shared reference must not leave a stale point")
 	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint1, ""), "error")
 	secondPath := fileStatusRegistryResult(t, statusCall, mountPoint2, "")
 	perPathError, ok := secondPath["error"].(map[string]any)
 	require.True(t, ok, "unmounting the second reference must remove its path")
 	assert.Equal(t, "outside_any_mount", perPathError["code"])
 
-	UnregisterMountPointForVFS(vfs1)
+	UnregisterMountPointForVFS(vfs1, mountPoint1)
 	shutdown1()
-	names, points = fileStatusRegistrySnapshot(t, listCall)
+	names = fileStatusRegistrySnapshot(t, listCall)
 	assert.NotContains(t, names, configName)
-	assert.NotContains(t, points, configName)
+	assert.Empty(t, GetMountPoint(configName))
+}
+
+func TestFileStatusRegistryUnregisterFirstOfDeduplicatedMounts(t *testing.T) {
+	r := fstest.NewRun(t)
+	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
+
+	vfs1, shutdown1 := newFileStatusRegistryVFS(t, r.Fremote, nil)
+	vfs2, shutdown2 := newFileStatusRegistryVFS(t, r.Fremote, &vfs1.Opt)
+	require.Same(t, vfs1, vfs2, "option-identical mounts share the active VFS")
+
+	configName := fs.ConfigString(r.Fremote)
+	mountPoint1 := filepath.Join(t.TempDir(), "first-mount")
+	mountPoint2 := filepath.Join(t.TempDir(), "second-mount")
+	RegisterMountPointForVFS(vfs1, mountPoint1)
+	RegisterMountPointForVFS(vfs2, mountPoint2)
+	t.Cleanup(func() {
+		UnregisterMountPointForVFS(vfs1, mountPoint1)
+		UnregisterMountPointForVFS(vfs2, mountPoint2)
+	})
+
+	statusCall := rc.Calls.Get("vfs/file-status")
+	require.NotNil(t, statusCall)
+
+	// The first reference goes away while the second stays live.
+	UnregisterMountPointForVFS(vfs1, mountPoint1)
+	shutdown1()
+	assert.Equal(t, mountPoint2, GetMountPoint(configName))
+	assert.Equal(t, mountPoint2, vfs1.MountPoint)
+	firstPath := fileStatusRegistryResult(t, statusCall, mountPoint1, "")
+	perPathError, ok := firstPath["error"].(map[string]any)
+	require.True(t, ok, "unmounting the first reference must remove its path")
+	assert.Equal(t, "outside_any_mount", perPathError["code"])
+	assert.NotContains(t, fileStatusRegistryResult(t, statusCall, mountPoint2, ""), "error",
+		"the surviving mount must keep answering its files")
+
+	UnregisterMountPointForVFS(vfs2, mountPoint2)
+	shutdown2()
+	assert.Empty(t, GetMountPoint(configName))
+	assert.Empty(t, vfs1.MountPoint)
 }
 
 func TestFileStatusRegistryNullMountPointDoesNotBecomeHostPath(t *testing.T) {
@@ -226,10 +239,9 @@ func TestFileStatusRegistryNullMountPointDoesNotBecomeHostPath(t *testing.T) {
 	require.NotNil(t, statusCall)
 	configName := fs.ConfigString(r.Fremote)
 
-	names, points := fileStatusRegistrySnapshot(t, listCall)
+	names := fileStatusRegistrySnapshot(t, listCall)
 	require.Contains(t, names, configName)
-	require.Contains(t, points, configName)
-	require.Nil(t, points[configName])
+	assert.Empty(t, GetMountPoint(configName))
 	assert.Empty(t, vfs.MountPoint)
 
 	hostPath := filepath.Join(t.TempDir(), "remote-file")
@@ -239,13 +251,13 @@ func TestFileStatusRegistryNullMountPointDoesNotBecomeHostPath(t *testing.T) {
 	assert.Equal(t, "outside_any_mount", perPathError["code"])
 	assert.Empty(t, vfs.MountPoint, "status lookup must not synthesize a host mount point")
 
-	_, points = fileStatusRegistrySnapshot(t, listCall)
-	require.Contains(t, points, configName)
-	assert.Nil(t, points[configName], "vfs/list must keep the mount point null")
+	assert.Empty(t, GetMountPoint(configName), "the private registry keeps no point for this VFS")
+	assert.Empty(t, vfs.MountPoint, "vfs/list must keep the mount point null")
 }
 
 func TestFileStatusRegistryCompletenessProperty(t *testing.T) {
 	r, vfs, listCall := rcNewRun(t, "vfs/list")
+	configName := fs.ConfigString(r.Fremote)
 	statusCall := rc.Calls.Get("vfs/file-status")
 	require.NotNil(t, statusCall)
 	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
@@ -261,7 +273,6 @@ func TestFileStatusRegistryCompletenessProperty(t *testing.T) {
 		}
 	}
 	require.True(t, listedFile, "the test file must be present in the VFS listing")
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
 	root := t.TempDir()
 
 	complete := func(input string) bool {
@@ -272,23 +283,10 @@ func TestFileStatusRegistryCompletenessProperty(t *testing.T) {
 		}
 		RegisterMountPointForVFS(vfs, mountPoint)
 
-		names, points := fileStatusRegistrySnapshot(t, listCall)
-		if len(names) != len(points) {
-			return false
-		}
-		for _, name := range names {
-			if _, ok := points[name]; !ok {
-				return false
-			}
-		}
-
-		identifier := ""
-		for name, point := range points {
-			if point == mountPoint {
-				identifier = name
-				break
-			}
-		}
+		names := fileStatusRegistrySnapshot(t, listCall)
+		require.Contains(t, names, configName)
+		defer UnregisterMountPointForVFS(vfs, mountPoint)
+		identifier := fileStatusIdentifierForMountPoint(t, names, mountPoint)
 		if identifier == "" {
 			return false
 		}

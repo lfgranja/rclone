@@ -144,12 +144,12 @@ func fileStatusFromSnapshot(v *VFS, snap vfscache.ItemSnapshot) FileStatus {
 		// A file with no bytes to be present has all of its bytes
 		// present.
 		local = FileLocalFullyHeld
-	case snap.DownloadErr != nil:
-		// A failed download takes the failure value rather than
-		// partly_held, whether or not the size is known; the held
-		// quantities still describe the bytes that did arrive, and
-		// where the size is unknown total_size carries the
-		// not_determinable marker.
+	case snap.DownloadErr != nil || snap.DownloadersErr != nil:
+		// A failed download, prefetch or background transfer takes
+		// the failure value rather than partly_held, whether or not
+		// the size is known; held quantities still describe the
+		// bytes that did arrive, and where the size is unknown
+		// total_size carries the not_determinable marker.
 		local = FileLocalDownloadFailed
 	case snap.Rs == nil || totalHeld == 0:
 		// No ranges held.

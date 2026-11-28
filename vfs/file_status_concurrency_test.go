@@ -60,7 +60,7 @@ func testFileStatusConcurrentListResolveUnmount(t *testing.T) {
 	vfs, shutdown := newFileStatusRegistryVFS(t, r.Fremote, nil)
 	mountPoint := t.TempDir()
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 
 	// Keep path resolution inside its registry scan long enough for vfs/list
 	// and teardown to contend for the opposite lock order.
@@ -143,7 +143,7 @@ func testFileStatusConcurrentListResolveUnmount(t *testing.T) {
 		for range readerCount {
 			<-firstReadDone
 		}
-		UnregisterMountPointForVFS(vfs)
+		UnregisterMountPointForVFS(vfs, mountPoint)
 		shutdown()
 		results <- nil
 	}()
@@ -190,7 +190,7 @@ func TestFileStatusPathRequestHoldsVFSAcrossUnmount(t *testing.T) {
 	vfs, shutdown := newFileStatusRegistryVFS(t, blockedFs, nil)
 	mountPoint := t.TempDir()
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 	statusCall := rc.Calls.Get("vfs/file-status")
 	require.NotNil(t, statusCall)
 
@@ -227,7 +227,7 @@ func TestFileStatusPathRequestHoldsVFSAcrossUnmount(t *testing.T) {
 
 	// The resolver has selected the VFS and is blocked inside its listing.
 	// An unmount must not tear that instance down before the answer is assembled.
-	UnregisterMountPointForVFS(vfs)
+	UnregisterMountPointForVFS(vfs, mountPoint)
 	shutdown()
 	release()
 

@@ -1735,6 +1735,31 @@ func TestFileStatusStateUnreachableFixtures(t *testing.T) {
 		assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
 	})
 
+	t.Run("download_failed_prefetch", func(t *testing.T) {
+		// A downloader started ahead of a read from cached
+		// bytes fails off the reader's path: the fault hits the
+		// read-ahead downloader, not a foreground waiter. The
+		// local fact is still download_failed, with the held
+		// quantities describing the cached prefix, and the
+		// pair maps to the not-fully-held-locally status.
+		const name = "prefetch-failed-download.txt"
+		const partial = 7
+		r, fixture, path := arrangeFileStatusPrefetchFailure(t, name, content, partial)
+		result := waitForFileStatusLocalState(t, r, fixture, path, statusDownloadFailed)
+
+		local, upload := requireFileStatusStatePair(t, result)
+		assert.Equal(t, statusDownloadFailed, local)
+		assert.Equal(t, statusNotApplicable, upload)
+
+		unbrokenRun, totalHeld, totalSize := fileStatusByteInfo(t, result)
+		requireFileStatusByteNumber(t, unbrokenRun, partial)
+		requireFileStatusByteNumber(t, totalHeld, partial)
+		requireFileStatusByteNumber(t, totalSize, int64(len(content)))
+
+		assert.Equal(t, exitNotFullyHeld, fileStatusExitCode(local, upload, true))
+		assert.NoError(t, checkFileStatusByteInvariants(local, unbrokenRun, totalHeld, totalSize))
+	})
+
 	t.Run("underivable", func(t *testing.T) {
 		// The file's cache record mid-rewrite by a concurrent
 		// reset when the read lands — the reset hook holding

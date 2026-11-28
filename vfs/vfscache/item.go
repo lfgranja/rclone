@@ -502,18 +502,6 @@ func (item *Item) GetWriteBackID() writeback.Handle {
 	return item.writeBackID
 }
 
-// GetDownloadersError returns the downloader error state for
-// detecting download failures. Returns errorCount and
-// lastErr, or 0 and nil if no downloaders.
-func (item *Item) GetDownloadersError() (errorCount int, lastErr error) {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	if item.downloaders == nil {
-		return 0, nil
-	}
-	return item.downloaders.GetError()
-}
-
 // IsBeingReset returns true if the cache cleaner is currently
 // resetting this item's cache file. Used to report underivable
 // without blocking. It reads an atomic flag, so unlike the
@@ -574,6 +562,9 @@ type ItemSnapshot struct {
 	// DownloadErr is the last download attempt's error, nil where
 	// the last attempt succeeded.
 	DownloadErr error
+	// DownloadersErr is the accumulated error of prefetch and
+	// background downloaders, which have no waiter to report it.
+	DownloadersErr error
 	// UploadErr is the last upload attempt's error, nil where the
 	// last attempt succeeded.
 	UploadErr error
@@ -589,6 +580,10 @@ func (item *Item) snapshotLocked() ItemSnapshot {
 		rs = make(ranges.Ranges, len(item.info.Rs))
 		copy(rs, item.info.Rs)
 	}
+	var downloadersErr error
+	if item.downloaders != nil {
+		downloadersErr = item.downloaders.LastError()
+	}
 	return ItemSnapshot{
 		Size:            item.info.Size,
 		Rs:              rs,
@@ -596,6 +591,7 @@ func (item *Item) snapshotLocked() ItemSnapshot {
 		WriteBackID:     item.writeBackID,
 		Fingerprint:     item.info.Fingerprint,
 		DownloadErr:     item.downloadErr,
+		DownloadersErr:  downloadersErr,
 		UploadErr:       item.uploadErr,
 		UploadCompleted: item.uploadCompleted,
 	}
@@ -1517,10 +1513,15 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 			return nil
 		}
 		// Otherwise start the downloader for the future if required.
-		// A range already present needs no download attempt, so its
-		// outcome leaves any recorded download failure untouched.
+		// A prefetch failure is recorded like a foreground failure;
+		// a successful prefetch clears the item's recorded failure.
 		err = item.downloaders.EnsureDownloader(r)
 		item.mu.Lock()
+		if err != nil {
+			item.downloadErr = err
+		} else {
+			item.downloadErr = nil
+		}
 		return err
 	}
 	if item.downloaders == nil {

@@ -67,7 +67,7 @@ func newFileStatusCountingFs(inner fs.Fs) *fileStatusCountingFs {
 func registerFileStatusTestMount(t *testing.T, testVFS *VFS, mountPoint string) {
 	t.Helper()
 	RegisterMountPointForVFS(testVFS, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(testVFS) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
 }
 
 func (f *fileStatusCountingFs) Features() *fs.Features {

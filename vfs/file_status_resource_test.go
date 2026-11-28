@@ -1326,7 +1326,7 @@ func TestFileStatusPerfCPUUnderLoad(t *testing.T) {
 // and are safe no-ops.
 func fileStatusTeardownWSSPoint(t *testing.T, vfs *VFS) {
 	t.Helper()
-	UnregisterMountPointForVFS(vfs)
+	UnregisterMountPointForVFS(vfs, "")
 	require.NoError(t, vfs.CleanUp(), "tearing down a WSS/MRC point")
 	vfs.Shutdown()
 	fileStatusSettleRSS()

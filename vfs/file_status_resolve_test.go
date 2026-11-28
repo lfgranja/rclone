@@ -118,38 +118,6 @@ func TestFileStatusResolveNonAbsoluteEntry(t *testing.T) {
 	}
 }
 
-// TestFileStatusResolveMountPointReport checks the one change
-// this work grants: the report of the mounts currently
-// running keeps its "vfses" array unchanged and gains a
-// "mountPoints" object of its own, keyed by the names the array
-// returns so a caller pairs a mount point with a mount by name
-// and never by position, carrying null for a VFS created without
-// a mount point — which every VFS a test process creates is.
-func TestFileStatusResolveMountPointReport(t *testing.T) {
-	r, _, call := rcNewRun(t, "vfs/list")
-
-	out, err := call.Fn(context.Background(), nil)
-	require.NoError(t, err)
-
-	vfses, ok := out["vfses"].([]string)
-	require.True(t, ok, "the report must keep its vfses array")
-	assert.Contains(t, vfses, fs.ConfigString(r.Fremote))
-
-	mountPoints, ok := out["mountPoints"]
-	require.True(t, ok, "the report must carry a mountPoints key")
-	points, ok := mountPointsObject(mountPoints)
-	require.True(t, ok, "mountPoints must be an object keyed by mount name")
-
-	// Every name the array returns appears in mountPoints, and a
-	// VFS created without a mount point reports null there.
-	require.Equal(t, len(vfses), len(points))
-	for _, name := range vfses {
-		point, ok := points[name]
-		require.True(t, ok, "mountPoints must carry an entry for %q", name)
-		assert.Nil(t, point, "a VFS created without a mount point reports a null mount point")
-	}
-}
-
 // TestFileStatusResolveOutsideAnyMount checks that a single
 // absolute path lying inside no registered mount point is the
 // outside-any-mount failure: it is a per-path result
@@ -202,10 +170,36 @@ func TestFileStatusResolveParentSymlinkUsesTargetMount(t *testing.T) {
 		t.Skipf("cannot create directory symlink: %v", err)
 	}
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 
 	result := fileStatusResolvePath(t, call, filepath.Join(linkParent, "file.txt"))
 	assert.NotContains(t, result, "error", "parent links are resolved to the mount serving their target")
+}
+
+func TestFileStatusResolveMountPointSymlink(t *testing.T) {
+	r, vfs, call := rcNewRun(t, "vfs/file-status")
+	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
+
+	target := t.TempDir()
+	mountPoint := filepath.Join(t.TempDir(), "mount-link")
+	if err := os.Symlink(target, mountPoint); err != nil {
+		t.Skipf("cannot create directory symlink: %v", err)
+	}
+	RegisterMountPointForVFS(vfs, mountPoint)
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
+
+	path := filepath.Join(mountPoint, "file.txt")
+	result := fileStatusResolvePath(t, call, path)
+	assert.NotContains(t, result, "error", "a mount point that is a symlink resolves files through its target")
+
+	out, err := call.Fn(context.Background(), rc.Params{
+		"fs":    fs.ConfigString(r.Fremote),
+		"paths": []string{path},
+	})
+	require.NoError(t, err)
+	statuses := decodeStatuses(t, out)
+	require.Len(t, statuses, 1)
+	assert.NotContains(t, statuses[0], "error", "identifier-based lookup resolves the symlinked mount point")
 }
 
 func TestFileStatusResolveDanglingParentSymlinkIsOutsideAnyMount(t *testing.T) {
@@ -217,7 +211,7 @@ func TestFileStatusResolveDanglingParentSymlinkIsOutsideAnyMount(t *testing.T) {
 		t.Skipf("cannot create directory symlink: %v", err)
 	}
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 
 	result := fileStatusResolvePath(t, call, filepath.Join(linkPath, "file.txt"))
 	perPathError, ok := result["error"].(map[string]any)
@@ -238,7 +232,7 @@ func TestFileStatusResolveFinalSymlinkIsNotFollowed(t *testing.T) {
 		t.Skipf("cannot create file symlink: %v", err)
 	}
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 
 	result := fileStatusResolvePath(t, call, filepath.Join(mountPoint, "link"))
 	assert.Equal(t, "not_regular_file", result["local"], "the final component is the VFS symlink itself")
@@ -257,8 +251,8 @@ func TestFileStatusResolveOverlappingMountsAreAmbiguous(t *testing.T) {
 	RegisterMountPointForVFS(vfs1, mountPoint1)
 	RegisterMountPointForVFS(vfs2, mountPoint2)
 	t.Cleanup(func() {
-		UnregisterMountPointForVFS(vfs2)
-		UnregisterMountPointForVFS(vfs1)
+		UnregisterMountPointForVFS(vfs2, mountPoint2)
+		UnregisterMountPointForVFS(vfs1, mountPoint1)
 	})
 
 	result := fileStatusResolvePath(t, call, filepath.Join(mountPoint2, "file.txt"))
@@ -275,7 +269,7 @@ func TestFileStatusResolveComponentBoundary(t *testing.T) {
 	require.NoError(t, os.Mkdir(mountPoint, 0700))
 	require.NoError(t, os.Mkdir(sibling, 0700))
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 
 	result := fileStatusResolvePath(t, call, filepath.Join(sibling, "file.txt"))
 	perPathError, ok := result["error"].(map[string]any)
@@ -291,7 +285,7 @@ func TestFileStatusResolveWindowsCaseInsensitive(t *testing.T) {
 	r.WriteObject(context.Background(), "file.txt", "content", time.Now())
 	mountPoint := t.TempDir()
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 
 	requestPath := filepath.Join(togglePathCase(mountPoint), "file.txt")
 	result := fileStatusResolvePath(t, call, requestPath)
@@ -318,20 +312,6 @@ func fileStatusResolvePath(t *testing.T, call *rc.Call, path string) map[string]
 	statuses := decodeStatuses(t, out)
 	require.Len(t, statuses, 1)
 	return statuses[0]
-}
-
-// mountPointsObject adapts the "mountPoints" value of the report
-// of the mounts currently running, which the contract fixes as an
-// object keyed by mount name, to a plain map whichever of the two
-// map types the report carries it as.
-func mountPointsObject(mountPoints any) (map[string]any, bool) {
-	switch points := mountPoints.(type) {
-	case rc.Params:
-		return points, true
-	case map[string]any:
-		return points, true
-	}
-	return nil, false
 }
 
 // decodeStatuses decodes the "statuses" array of a file-status

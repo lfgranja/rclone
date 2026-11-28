@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"testing/quick"
@@ -267,7 +268,7 @@ func (fixture *fileStatusFailureFixture) start(t *testing.T, opt *vfscommon.Opti
 
 func (fixture *fileStatusFailureFixture) restart(t *testing.T, opt *vfscommon.Options) {
 	t.Helper()
-	UnregisterMountPointForVFS(fixture.vfs)
+	UnregisterMountPointForVFS(fixture.vfs, fixture.remote.Root())
 	fixture.vfs.Shutdown()
 	fixture.vfs = nil
 	fixture.start(t, opt)
@@ -280,7 +281,7 @@ func (fixture *fileStatusFailureFixture) close(t *testing.T) {
 	}
 	vfs := fixture.vfs
 	fixture.vfs = nil
-	UnregisterMountPointForVFS(vfs)
+	UnregisterMountPointForVFS(vfs, fixture.remote.Root())
 	vfs.Shutdown()
 	require.NoError(t, vfs.CleanUp())
 }
@@ -373,6 +374,64 @@ func fileStatusFailureResultDuringUpload(t *testing.T, r *fstest.Run, fixture *f
 	}
 }
 
+// waitForFileStatusLocalState polls the endpoint for the local fact,
+// which a background downloader sets off the reader's path.
+func waitForFileStatusLocalState(t *testing.T, r *fstest.Run, fixture *fileStatusFailureFixture, path, want string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(fileStatusFailureWaitTimeout)
+	for {
+		status := fileStatusFailureResult(t, r, fixture, path)
+		if status["local"] == want {
+			return status
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for local state %q; last status: %v", want, status["local"])
+			return status
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// arrangeFileStatusPrefetchFailure caches a prefix of a remote file
+// and reads that prefix with read-ahead enabled, so the cached-range
+// path starts a downloader for the missing remainder. The injected
+// fault makes that downloader fail off the reader's path.
+func arrangeFileStatusPrefetchFailure(t *testing.T, name, content string, partial int64) (*fstest.Run, *fileStatusFailureFixture, string) {
+	t.Helper()
+	opt := fileStatusStateOpt(vfscommon.CacheModeFull, fileStatusFailureWriteBackDelay)
+	opt.ReadAhead = 64
+	r, fixture := newFileStatusFailureFixture(t, opt)
+	r.WriteObject(context.Background(), name, content, t1)
+	listFileStatusStateRoot(t, fixture.vfs)
+	path := fileStatusStatePath(r, name)
+
+	object, err := fixture.remote.NewObject(context.Background(), name)
+	require.NoError(t, err)
+	seedFileStatusStateCacheRanges(t, fixture.vfs, name, object,
+		fileStatusStateCacheRange{offset: 0, content: []byte(content[:partial])})
+
+	faultErr := errors.New("injected prefetch failure")
+	fixture.control.failDownloadPlan(name,
+		fileStatusDownloadFault{err: faultErr},
+		fileStatusDownloadFault{err: faultErr},
+	)
+	h, err := fixture.vfs.OpenFile(name, os.O_RDONLY, 0777)
+	require.NoError(t, err)
+	buf := make([]byte, partial)
+	n, err := io.ReadFull(h, buf)
+	require.NoError(t, err)
+	assert.Equal(t, int(partial), n)
+	assert.Equal(t, content[:partial], string(buf))
+	require.NoError(t, h.Close())
+	select {
+	case remote := <-fixture.control.downloadErrors:
+		assert.Equal(t, name, remote)
+	case <-time.After(fileStatusFailureWaitTimeout):
+		t.Fatal("the injected prefetch error was not reached")
+	}
+	return r, fixture, path
+}
+
 func TestFileStatusPartialDownloadFailureClearsAfterSuccessfulRetry(t *testing.T) {
 	const (
 		name    = "partial-download.txt"
@@ -402,6 +461,40 @@ func TestFileStatusPartialDownloadFailureClearsAfterSuccessfulRetry(t *testing.T
 	requireFileStatusFailureByte(t, failed, "unbroken_run", partial)
 	requireFileStatusFailureByte(t, failed, "total_held", partial)
 	requireFileStatusFailureByte(t, failed, "total_size", int64(len(content)))
+
+	fixture.control.clearDownloadPlan(name)
+	got, err := fixture.vfs.ReadFile(name)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(got))
+	recovered := fileStatusFailureResult(t, r, fixture, path)
+	assert.Equal(t, "fully_held", recovered["local"])
+}
+
+// TestFileStatusPrefetchFailureClearsAfterSuccessfulRetry checks that
+// a failed read-ahead downloader is reported without a foreground
+// waiter, that repeating the cached read leaves the failure in place,
+// and that a later successful transfer clears it.
+func TestFileStatusPrefetchFailureClearsAfterSuccessfulRetry(t *testing.T) {
+	const (
+		name    = "prefetch-failure.txt"
+		content = "0123456789abcdefghijklmnopqrstuvwxyz"
+		partial = 7
+	)
+	r, fixture, path := arrangeFileStatusPrefetchFailure(t, name, content, partial)
+	failed := waitForFileStatusLocalState(t, r, fixture, path, "download_failed")
+	requireFileStatusFailureByte(t, failed, "unbroken_run", partial)
+	requireFileStatusFailureByte(t, failed, "total_held", partial)
+	requireFileStatusFailureByte(t, failed, "total_size", int64(len(content)))
+
+	// Another read of the cached prefix schedules the prefetch
+	// again; a queued retry does not clear the recorded failure.
+	h, err := fixture.vfs.OpenFile(name, os.O_RDONLY, 0777)
+	require.NoError(t, err)
+	_, err = io.ReadFull(h, make([]byte, partial))
+	require.NoError(t, err)
+	require.NoError(t, h.Close())
+	retried := fileStatusFailureResult(t, r, fixture, path)
+	assert.Equal(t, "download_failed", retried["local"])
 
 	fixture.control.clearDownloadPlan(name)
 	got, err := fixture.vfs.ReadFile(name)

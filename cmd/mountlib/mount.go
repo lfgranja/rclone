@@ -447,7 +447,7 @@ func (m *MountPoint) Wait() error {
 func (m *MountPoint) Unmount() (err error) {
 	// Unregister the mount point from the VFS registry before shutting down
 	if m.VFS != nil {
-		vfs.UnregisterMountPointForVFS(m.VFS)
+		vfs.UnregisterMountPointForVFS(m.VFS, m.MountPoint)
 	}
 	defer m.shutdownVFS()
 	if m.UnmountFn != nil {

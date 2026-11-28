@@ -226,7 +226,7 @@ func TestFileStatusBCESuccessFixtures(t *testing.T) {
 		t.Cleanup(func() { cleanupVFS(t, testVFS) })
 		mountPoint := filepath.Join(t.TempDir(), "mount")
 		RegisterMountPointForVFS(testVFS, mountPoint)
-		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS) })
+		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
 
 		content := make([]byte, 1024)
 		for i := range content {
@@ -267,17 +267,70 @@ func TestFileStatusBCESuccessFixtures(t *testing.T) {
 // TestFileStatusBCEFaultFixtures pins the fault fixtures' stable fields.
 func TestFileStatusBCEFaultFixtures(t *testing.T) {
 	t.Run("not_found_shape", func(t *testing.T) {
-		fixture := bceLoadFixture(t, "not_found.json")
-		statuses, ok := fixture["statuses"].([]any)
+		r := fstest.NewRun(t)
+		opt := vfscommon.Opt
+		opt.CacheMode = vfscommon.CacheModeFull
+		opt.DirCacheTime = 0
+		testVFS := New(context.Background(), r.Fremote, &opt)
+		t.Cleanup(func() { cleanupVFS(t, testVFS) })
+		mountPoint := filepath.Join(t.TempDir(), "mount")
+		RegisterMountPointForVFS(testVFS, mountPoint)
+		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
+		root, err := testVFS.Root()
+		require.NoError(t, err)
+		_, err = root.ReadDirAll()
+		require.NoError(t, err)
+
+		call := rc.Calls.Get("vfs/file-status")
+		require.NotNil(t, call)
+		out, err := call.Fn(context.Background(), rc.Params{
+			"fs":    fs.ConfigString(r.Fremote),
+			"paths": []string{filepath.Join(mountPoint, "nonexistent.txt")},
+		})
+		require.NoError(t, err)
+		raw, err := json.Marshal(out)
+		require.NoError(t, err)
+		var actual map[string]any
+		require.NoError(t, json.Unmarshal(raw, &actual))
+		statuses, ok := actual["statuses"].([]any)
 		require.True(t, ok && len(statuses) == 1)
-		bceCompareNormalized(t, "not_found.json", fixture, "")
+		bceCompareNormalized(t, "not_found.json", actual, mountPoint)
 	})
 
 	t.Run("directory_not_file_shape", func(t *testing.T) {
-		fixture := bceLoadFixture(t, "directory_not_file.json")
-		statuses, ok := fixture["statuses"].([]any)
+		r := fstest.NewRun(t)
+		if r.Fremote.Features().CanHaveEmptyDirectories {
+			require.NoError(t, r.Fremote.Mkdir(context.Background(), "dir"))
+		} else {
+			r.WriteObject(context.Background(), "dir/keep.txt", "keep", time.Now())
+		}
+		opt := vfscommon.Opt
+		opt.CacheMode = vfscommon.CacheModeFull
+		opt.DirCacheTime = 0
+		testVFS := New(context.Background(), r.Fremote, &opt)
+		t.Cleanup(func() { cleanupVFS(t, testVFS) })
+		mountPoint := filepath.Join(t.TempDir(), "mount")
+		RegisterMountPointForVFS(testVFS, mountPoint)
+		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
+		root, err := testVFS.Root()
+		require.NoError(t, err)
+		_, err = root.ReadDirAll()
+		require.NoError(t, err)
+
+		call := rc.Calls.Get("vfs/file-status")
+		require.NotNil(t, call)
+		out, err := call.Fn(context.Background(), rc.Params{
+			"fs":    fs.ConfigString(r.Fremote),
+			"paths": []string{filepath.Join(mountPoint, "dir")},
+		})
+		require.NoError(t, err)
+		raw, err := json.Marshal(out)
+		require.NoError(t, err)
+		var actual map[string]any
+		require.NoError(t, json.Unmarshal(raw, &actual))
+		statuses, ok := actual["statuses"].([]any)
 		require.True(t, ok && len(statuses) == 1)
-		bceCompareNormalized(t, "directory_not_file.json", fixture, "")
+		bceCompareNormalized(t, "directory_not_file.json", actual, mountPoint)
 	})
 
 	// Live wiring: missing entry in a current listing reports not_found
@@ -291,7 +344,7 @@ func TestFileStatusBCEFaultFixtures(t *testing.T) {
 		t.Cleanup(func() { cleanupVFS(t, testVFS) })
 		mountPoint := filepath.Join(t.TempDir(), "mount")
 		RegisterMountPointForVFS(testVFS, mountPoint)
-		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS) })
+		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
 
 		r.WriteObject(context.Background(), "bce-present.txt", "present", time.Now())
 		if r.Fremote.Features().CanHaveEmptyDirectories {
@@ -377,7 +430,7 @@ func TestFileStatusBCEBoundaryFixtures(t *testing.T) {
 		t.Cleanup(func() { cleanupVFS(t, testVFS) })
 		mountPoint := filepath.Join(t.TempDir(), "mount")
 		RegisterMountPointForVFS(testVFS, mountPoint)
-		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS) })
+		t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
 
 		r.WriteObject(context.Background(), "bce-link.rclonelink", "/target/of/link", time.Now())
 		root, err := testVFS.Root()
@@ -441,8 +494,8 @@ func TestFileStatusBCESharedConfigBareName(t *testing.T) {
 	RegisterMountPointForVFS(vfs1, mountPoint1)
 	RegisterMountPointForVFS(vfs2, mountPoint2)
 	t.Cleanup(func() {
-		UnregisterMountPointForVFS(vfs1)
-		UnregisterMountPointForVFS(vfs2)
+		UnregisterMountPointForVFS(vfs1, mountPoint1)
+		UnregisterMountPointForVFS(vfs2, mountPoint2)
 		for name, point := range GetAllMountPoints() {
 			if point == mountPoint1 || point == mountPoint2 {
 				UnregisterMountPoint(name)
@@ -478,15 +531,9 @@ func TestFileStatusBCESharedConfigBareName(t *testing.T) {
 	// Each indexed name reported by vfs/list still addresses its own mount.
 	out, err := listCall.Fn(context.Background(), nil)
 	require.NoError(t, err)
-	points, ok := mountPointsObject(out["mountPoints"])
-	require.True(t, ok)
-	indexed := ""
-	for name, point := range points {
-		if point == mountPoint1 {
-			indexed = name
-		}
-	}
-	require.NotEmpty(t, indexed, "vfs/list must report the first mount point under its indexed name")
+	names, ok := out["vfses"].([]string)
+	require.True(t, ok, "vfs/list must return its vfses array")
+	indexed := fileStatusIdentifierForMountPoint(t, names, mountPoint1)
 	out, err = statusCall.Fn(context.Background(), rc.Params{
 		"fs":    indexed,
 		"paths": []string{filepath.Join(mountPoint1, "bce-shared.txt")},

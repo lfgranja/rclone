@@ -31,7 +31,7 @@ func fileStatusObservationOpt(cacheMode vfscommon.CacheMode, writeBack fs.Durati
 func registerFileStatusObservationMount(t *testing.T, vfs *VFS, mountPoint string) {
 	t.Helper()
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
 }
 
 type fileStatusResetBarrierObject struct {

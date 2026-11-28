@@ -48,7 +48,7 @@ func conformanceMount(t *testing.T, r *fstest.Run, opt *vfscommon.Options) (*VFS
 	t.Cleanup(func() { cleanupVFS(t, testVFS) })
 	mountPoint := filepath.Join(t.TempDir(), "mount")
 	RegisterMountPointForVFS(testVFS, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(testVFS) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(testVFS, mountPoint) })
 	return testVFS, mountPoint
 }
 

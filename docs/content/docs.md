@@ -3448,9 +3448,9 @@ it will log a high priority message if the retry was successful.
 
 Exit codes `11` and `12` belong to `rclone vfs status`, which asks a
 running mount about one named file: whether the file is held in the
-local cache and whether its content has reached the remote. The
-reported JSON object always carries both facts, so a caller that needs
-the fact the exit status did not name never has to ask twice.
+local cache and whether its content has reached the remote. A state
+result always carries both facts, so a caller that needs the fact the
+exit status did not name never has to ask twice.
 
 The mapping, in numeric order:
 
@@ -3462,9 +3462,10 @@ The mapping, in numeric order:
   file, a path that does not exist, or a mount whose control interface
   is unreachable. A directory and a missing path take `1`, not `3`
   or `4`, so no number carries two meanings.
-- `2` - the invocation itself was wrong: no path given, an empty path,
-  or more than one path. The command answers for one path per
-  invocation.
+- `2` - the invocation was rejected as a usage error: no path or more
+  than one path argument, an empty or relative path (`empty_path`), or
+  an invalid parameter value (`param_invalid`). `vfs status` accepts
+  one path per invocation.
 - `11` - the file is not fully held locally and the mount keeps a
   cache. This status takes precedence over `12`: a file that is both
   partly held and awaiting upload exits `11`, with the upload fact
@@ -3496,7 +3497,7 @@ Known limitations of `rclone vfs status`:
   reads; a consumer issuing reads in a tight loop paces itself. A read
   still never waits on a transfer of the file.
 - Enumeration deferred: there is no listing of which files a mount
-  holds. The caller names the paths it cares about, one per invocation.
+  holds. The caller names the path it cares about, one per invocation.
 - Grace period: keeping a closed file's cache entry alive so that
   reopening is cheap changes nothing reported. An entry removed by
   eviction or reset reads as not held, exactly like one never cached.

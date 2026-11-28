@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,13 +17,14 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/vfs"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
 var (
 	// url is the control server address
-	url = "http://localhost:5572/"
+	rcURL = "http://localhost:5572/"
 	// unixSocket is the unix domain socket path
 	unixSocket = ""
 	// authUser is the HTTP basic auth username
@@ -38,7 +40,7 @@ func init() {
 	vfsCommand.AddCommand(commandDefinition)
 	commandDefinition.Flags().StringVar(&fsFlag, "fs", "", "remote config name of the mount to report on, where a path lies inside more than one registered mount point")
 	// Add rc flags as alternate flags
-	commandDefinition.Flags().StringVarP(&url, "rc-addr", "", "http://localhost:5572/", "URL to connect to rclone remote control")
+	commandDefinition.Flags().StringVarP(&rcURL, "rc-addr", "", "http://localhost:5572/", "URL to connect to rclone remote control")
 	commandDefinition.Flags().StringVarP(&unixSocket, "unix-socket", "", "", "Path to a unix domain socket to dial to, instead of opening a TCP connection directly")
 	commandDefinition.Flags().StringVarP(&authUser, "rc-user", "", "", "Username to use to rclone remote control")
 	commandDefinition.Flags().StringVarP(&authPass, "rc-pass", "", "", "Password to use to connect to rclone remote control")
@@ -93,7 +95,7 @@ E.g.
 
 func parseFlags() {
 	// set alternates from alternate flags
-	setAlternateFlag("rc-addr", &url)
+	setAlternateFlag("rc-addr", &rcURL)
 	setAlternateFlag("rc-user", &authUser)
 	setAlternateFlag("rc-pass", &authPass)
 	// unix:///path handling per existing RC address rules
@@ -101,31 +103,30 @@ func parseFlags() {
 	// A unix address is reachable with no further flags: the socket
 	// becomes the dial target and the URL a dummy localhost URL,
 	// since the unix dialer ignores the host.
-	if strings.HasPrefix(url, "unix://") {
-		sock := strings.TrimPrefix(url, "unix://")
+	if strings.HasPrefix(rcURL, "unix://") {
+		sock := strings.TrimPrefix(rcURL, "unix://")
 		if sock != "" {
 			unixSocket = sock
 		}
-		url = "http://localhost/"
+		rcURL = "http://localhost/"
 		return
 	}
-	if filepath.IsAbs(url) {
-		unixSocket = url
-		url = "http://localhost/"
+	if filepath.IsAbs(rcURL) {
+		unixSocket = rcURL
+		rcURL = "http://localhost/"
 		return
 	}
-	// TCP rules copied from cmd/rc
-	// If url is just :port then fix it up
-	if strings.HasPrefix(url, ":") {
-		url = "localhost" + url
+	// A bare :port is a TCP address on localhost.
+	if strings.HasPrefix(rcURL, ":") {
+		rcURL = "localhost" + rcURL
 	}
 	// if url is just host:port add http://
-	if !strings.HasPrefix(url, "http:") && !strings.HasPrefix(url, "https:") {
-		url = "http://" + url
+	if !strings.HasPrefix(rcURL, "http:") && !strings.HasPrefix(rcURL, "https:") {
+		rcURL = "http://" + rcURL
 	}
 	// if url doesn't end with / add it
-	if !strings.HasSuffix(url, "/") {
-		url += "/"
+	if !strings.HasSuffix(rcURL, "/") {
+		rcURL += "/"
 	}
 }
 
@@ -166,13 +167,13 @@ func run(ctx context.Context, pathArg string) error {
 	// Do the call
 	out, err := doCall(ctx, "vfs/file-status", in)
 	if err != nil {
-		// Transport loss (dial failure or mid-body disconnect) is
-		// reported as mount_unreachable.
+		// A transport loss is a query failure with the mount_unreachable code.
 		if isTransportLoss(err) {
-			emitError(pathArg, "mount_unreachable", "mount is not reachable; start it with --rc to allow queries")
-			os.Exit(1)
+			code := "mount_unreachable"
+			emitError(pathArg, code, "mount is not reachable; start it with --rc to allow queries")
+			os.Exit(exitCodeForErrorCode(code))
 		}
-		// Whole-request typed error preserves its code/message.
+		// A whole-request typed error preserves its code and message.
 		if out != nil {
 			if errObj, ok := out["error"].(map[string]any); ok {
 				code, _ := errObj["code"].(string)
@@ -182,31 +183,32 @@ func run(ctx context.Context, pathArg string) error {
 						message = err.Error()
 					}
 					emitError(pathArg, code, message)
-					os.Exit(1)
+					os.Exit(exitCodeForErrorCode(code))
 				}
 			}
-			// Code-less envelope (rc server string error) is param_invalid.
 			if errStr, ok := out["error"].(string); ok && errStr != "" {
-				emitError(pathArg, "param_invalid", errStr)
-				os.Exit(1)
+				code := "param_invalid"
+				emitError(pathArg, code, errStr)
+				os.Exit(exitCodeForErrorCode(code))
 			}
 		}
-		// Any other RC/transport failure still emits JSON + exit 1.
-		emitError(pathArg, "param_invalid", err.Error())
-		os.Exit(1)
+		code := "param_invalid"
+		emitError(pathArg, code, err.Error())
+		os.Exit(exitCodeForErrorCode(code))
 	}
 
-	// Extract the single result from statuses array
 	statuses, ok := out["statuses"].([]any)
 	if !ok || len(statuses) == 0 {
-		emitError(pathArg, "param_invalid", "unexpected response format: missing statuses array")
-		os.Exit(1)
+		code := "param_invalid"
+		emitError(pathArg, code, "unexpected response format: missing statuses array")
+		os.Exit(exitCodeForErrorCode(code))
 	}
 
 	status, ok := statuses[0].(map[string]any)
 	if !ok || status == nil {
-		emitError(pathArg, "param_invalid", "unexpected status format")
-		os.Exit(1)
+		code := "param_invalid"
+		emitError(pathArg, code, "unexpected status format")
+		os.Exit(exitCodeForErrorCode(code))
 	}
 
 	// Per-path error echoes the single result object.
@@ -225,8 +227,7 @@ func run(ctx context.Context, pathArg string) error {
 	return nil
 }
 
-// Format an error and create a synthetic server return from it.
-// Scaffold copied from cmd/rc/rc.go errorf, then edited by hand.
+// errorf formats err and returns the synthetic RC error response.
 func errorf(status int, path string, format string, arg ...any) (out rc.Params, err error) {
 	err = fmt.Errorf(format, arg...)
 	out = make(rc.Params)
@@ -236,14 +237,9 @@ func errorf(status int, path string, format string, arg ...any) (out rc.Params, 
 	return out, err
 }
 
-// do a call from (path, in) to (out, err).
+// doCall posts in to the RC path and returns the decoded response.
 //
-// Scaffold copied from cmd/rc/rc.go doCall (HTTP branch only; no
-// loopback flag on this command), then edited by hand: local
-// request URL (no global mutation) and fixed read-error errorf
-// argument order (status, path, format).
-//
-// if err is set, out may be a valid error return or it may be nil
+// If err is set, out may be a valid error return or nil.
 func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err error) {
 	var client *http.Client
 	if unixSocket == "" {
@@ -251,7 +247,7 @@ func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err 
 	} else {
 		client = fshttp.NewClientWithUnixSocket(ctx, unixSocket)
 	}
-	requestURL := url + path
+	requestURL := rcURL + path
 	data, err := json.Marshal(in)
 	if err != nil {
 		return errorf(http.StatusBadRequest, path, "failed to encode request: %w", err)
@@ -269,7 +265,7 @@ func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err 
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return errorf(http.StatusServiceUnavailable, path, "connection failed: %w", err)
+		return errorf(http.StatusServiceUnavailable, path, "connection failed: %w", &transportError{err: err})
 	}
 	defer fs.CheckClose(resp.Body, &err)
 
@@ -279,7 +275,7 @@ func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err 
 	body, err = io.ReadAll(resp.Body)
 	bodyString = strings.TrimSpace(string(body))
 	if err != nil {
-		return errorf(resp.StatusCode, path, "failed to read rc response: %s: %s", resp.Status, bodyString)
+		return errorf(resp.StatusCode, path, "failed to read rc response: %w: %s", &responseReadError{err: err}, bodyString)
 	}
 
 	// Parse output
@@ -297,24 +293,38 @@ func doCall(ctx context.Context, path string, in rc.Params) (out rc.Params, err 
 	return out, err
 }
 
-// isTransportLoss reports whether err is a transport-level failure:
-// the dial itself failed or the response body was lost mid-read.
-// Both map to mount_unreachable.
+// responseReadError marks a failure while reading the RC response body.
+type responseReadError struct {
+	err error
+}
+
+func (e *responseReadError) Error() string { return e.err.Error() }
+
+func (e *responseReadError) Unwrap() error { return e.err }
+
+// transportError marks a failure returned by the HTTP client.
+type transportError struct {
+	err error
+}
+
+func (e *transportError) Error() string { return e.err.Error() }
+
+func (e *transportError) Unwrap() error { return e.err }
+
+// isTransportLoss reports whether err is a client.Do or response read failure.
 func isTransportLoss(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "connection failed") {
+	var readErr *responseReadError
+	if errors.As(err, &readErr) {
 		return true
 	}
-	if strings.Contains(msg, "failed to read rc response") {
+	var transportErr *transportError
+	if errors.As(err, &transportErr) {
 		return true
 	}
-	if strings.Contains(msg, "unexpected EOF") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") {
-		return true
-	}
-	return false
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe)
 }
 
 // emitJSON writes a single JSON object to stdout.
@@ -333,34 +343,22 @@ func emitError(path, code, message string) {
 	})
 }
 
-// exitCodeForErrorCode maps error codes to exit codes
+// exitCodeForErrorCode maps error codes to their documented exit status.
 func exitCodeForErrorCode(code string) int {
 	switch code {
-	case "empty_path", "param_invalid", "no_active_mount", "ambiguous_mount", "not_found", "unaccountable_path", "directory_not_file", "mount_unreachable":
-		return 1 // Query failed
+	case "empty_path", "param_invalid":
+		return 2 // Invocation error.
+	case "no_active_mount", "ambiguous_mount", "not_found", "unaccountable_path", "directory_not_file", "mount_unreachable":
+		return 1 // Query failed.
 	default:
 		return 1
 	}
 }
 
-// exitCodeForState maps local/upload state to exit code.
-//
-// Success (0) only for fully_held with uploaded/not_applicable.
-// On cache-off (upload not_tracked) every content state takes 12;
-// not_regular_file keeps 11 even there. On cache-keeping mounts any
-// non-fully_held local state takes 11 (precedence over 12).
+// exitCodeForState maps reported local and upload states to their exit status.
 func exitCodeForState(local, upload string) int {
-	if upload == "not_tracked" {
-		if local == "not_regular_file" {
-			return 11
-		}
-		return 12
-	}
-	if local != "fully_held" {
-		return 11
-	}
-	if upload == "uploaded" || upload == "not_applicable" {
-		return 0
-	}
-	return 12
+	return (vfs.FileStatus{
+		Local:  vfs.FileLocalState(local),
+		Upload: vfs.FileUploadState(upload),
+	}).ExitCode(upload == string(vfs.FileUploadNotTracked))
 }

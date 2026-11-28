@@ -2,12 +2,14 @@ package status
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -584,6 +586,7 @@ func TestWholeRequestFailuresAreJSON(t *testing.T) {
 		contentType string
 		body        string
 		wantCode    string
+		wantExit    int
 	}{
 		{
 			name:        "endpoint typed error",
@@ -591,6 +594,15 @@ func TestWholeRequestFailuresAreJSON(t *testing.T) {
 			contentType: "application/json",
 			body:        `{"error":{"code":"no_active_mount","message":"no active mount"}}`,
 			wantCode:    "no_active_mount",
+			wantExit:    1,
+		},
+		{
+			name:        "endpoint empty path error",
+			statusCode:  http.StatusBadRequest,
+			contentType: "application/json",
+			body:        `{"error":{"code":"empty_path","message":"empty path"}}`,
+			wantCode:    "empty_path",
+			wantExit:    2,
 		},
 		{
 			name:        "rc server code-less bad request",
@@ -598,6 +610,7 @@ func TestWholeRequestFailuresAreJSON(t *testing.T) {
 			contentType: "application/json",
 			body:        `{"status":400,"error":"could not decode request"}`,
 			wantCode:    "param_invalid",
+			wantExit:    2,
 		},
 	}
 	for _, test := range tests {
@@ -607,8 +620,8 @@ func TestWholeRequestFailuresAreJSON(t *testing.T) {
 				writeRawResponse(w, test.statusCode, test.contentType, test.body)
 			})
 			code, stdout, _ := runVFSStatusAt(t, server.URL, path)
-			if code != 1 {
-				t.Errorf("whole-request %s: exit code = %d, want 1", test.name, code)
+			if code != test.wantExit {
+				t.Errorf("whole-request %s: exit code = %d, want %d", test.name, code, test.wantExit)
 			}
 			assertErrorJSON(t, stdout, path, test.wantCode)
 			request := receiveStatusRequest(t, requests)
@@ -641,8 +654,8 @@ func TestOtherRCFailuresStillProduceJSON(t *testing.T) {
 				writeRawResponse(w, test.statusCode, test.contentType, test.body)
 			})
 			code, stdout, _ := runVFSStatusAt(t, server.URL, path)
-			if code != 1 {
-				t.Errorf("%s: exit code = %d, want 1", test.name, code)
+			if code != 2 {
+				t.Errorf("%s: exit code = %d, want 2 for param_invalid", test.name, code)
 			}
 			assertErrorJSON(t, stdout, path, "")
 		})
@@ -765,8 +778,8 @@ func TestRCAuthenticationAndAuthenticationErrorOutput(t *testing.T) {
 	}
 
 	code, stdout, _ = runVFSStatusAt(t, server.URL, "--rc-user=rc-user", "--rc-pass=wrong", path)
-	if code != 1 {
-		t.Errorf("rejected RC credentials: exit code = %d, want 1", code)
+	if code != 2 {
+		t.Errorf("rejected RC credentials: exit code = %d, want 2 for param_invalid", code)
 	}
 	assertErrorJSON(t, stdout, path, "")
 	badRequest := receiveStatusRequest(t, requests)
@@ -818,4 +831,64 @@ func TestResponseBodyDisconnectMapsToMountUnreachable(t *testing.T) {
 		t.Errorf("mid-response disconnect: exit code = %d, want 1", code)
 	}
 	assertErrorJSON(t, stdout, path, "mount_unreachable")
+}
+
+func TestInvalidRCAddressIsParamInvalid(t *testing.T) {
+	path := "/mnt/test/file.txt"
+	code, stdout, _ := runVFSStatusAt(t, "http://%zz", path)
+	if code != 2 {
+		t.Errorf("invalid --rc-addr: exit code = %d, want 2", code)
+	}
+	assertErrorJSON(t, stdout, path, "param_invalid")
+}
+
+func TestMalformedChunkedResponseMapsToMountUnreachable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "response writer cannot hijack", http.StatusInternalServerError)
+			return
+		}
+		connection, buffer, err := hijacker.Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = io.WriteString(buffer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\nnot-hex\r\n0\r\n\r\n")
+		_ = buffer.Flush()
+		_ = connection.Close()
+	}))
+	t.Cleanup(server.Close)
+
+	path := "/mnt/test/file.txt"
+	code, stdout, _ := runVFSStatusAt(t, server.URL, path)
+	if code != 1 {
+		t.Errorf("malformed chunked body: exit code = %d, want 1", code)
+	}
+	assertErrorJSON(t, stdout, path, "mount_unreachable")
+}
+
+func TestErrorfWrapsClassificationMarkers(t *testing.T) {
+	path := "/mnt/test/file.txt"
+	readErr := io.ErrUnexpectedEOF
+	out, err := errorf(http.StatusOK, path, "failed to read rc response: %w: %s", &responseReadError{err: readErr}, "")
+	if !errors.Is(err, readErr) {
+		t.Errorf("errorf error = %v, want it to wrap %v", err, readErr)
+	}
+	if got, _ := out["error"].(string); got != err.Error() {
+		t.Errorf("errorf response error = %q, want %q", got, err.Error())
+	}
+	if !isTransportLoss(err) {
+		t.Errorf("isTransportLoss(%v) = false, want true for a response read error", err)
+	}
+
+	parseErr := &url.Error{Op: "parse", URL: "http://%zz", Err: errors.New("invalid URL escape")}
+	_, err = errorf(http.StatusInternalServerError, path, "failed to make request: %w", parseErr)
+	if isTransportLoss(err) {
+		t.Errorf("isTransportLoss(%v) = true, want false for a URL parse error", err)
+	}
+
+	_, err = errorf(http.StatusServiceUnavailable, path, "connection failed: %w", &transportError{err: errors.New("dial failed")})
+	if !isTransportLoss(err) {
+		t.Errorf("isTransportLoss(%v) = false, want true for a client.Do error", err)
+	}
 }

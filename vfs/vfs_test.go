@@ -40,8 +40,12 @@ func TestMain(m *testing.M) {
 func cleanupVFS(t *testing.T, vfs *VFS) {
 	vfs.WaitForWriters(waitForWritersDelay)
 	err := vfs.CleanUp()
+	// The reference count records a VFS a test already released, so
+	// the last release removes it from the active cache exactly once.
+	if vfs.inUse.Load() > 0 {
+		vfs.Shutdown()
+	}
 	require.NoError(t, err)
-	vfs.Shutdown()
 }
 
 // Create a new VFS

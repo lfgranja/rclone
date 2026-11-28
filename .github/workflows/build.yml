@@ -32,13 +32,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job_name: ['linux', 'linux_386', 'windows', 'other_os', 'go1.26']
+        job_name: ['linux', 'linux_386', 'windows', 'go1.26']
 
         include:
           - job_name: linux
             os: ubuntu-latest
             go: '~1.27.2'
-            gotags: cmount
             build_flags: '-include "^linux/"'
             check: true
             quicktest: true
@@ -61,13 +60,6 @@ jobs:
             build_flags: '-include "^windows/"'
             build_args: '-buildmode exe'
             quicktest: true
-            deploy: true
-
-          - job_name: other_os
-            os: ubuntu-latest
-            go: '~1.27.2'
-            build_flags: '-exclude "^(windows/|darwin/|linux/)"'
-            compile_all: true
             deploy: true
 
           - job_name: go1.26

@@ -1,0 +1,11 @@
+{
+  "statuses": [
+    {
+      "path": "/mnt/test/dir",
+      "error": {
+        "code": "directory_not_file",
+        "message": "Path names a directory"
+      }
+    }
+  ]
+}

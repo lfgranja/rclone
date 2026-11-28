@@ -188,6 +188,13 @@ func (c *Cache) QueueSetExpiry(id writeback.Handle, expiry time.Time, relative t
 	return c.writeback.SetExpiry(id, expiry, relative)
 }
 
+// WritebackUploading returns true if the writeback item with the
+// given handle is currently being uploaded. Used for status
+// reporting.
+func (c *Cache) WritebackUploading(id writeback.Handle) bool {
+	return c.writeback.IsUploading(id)
+}
+
 // createDir creates a directory path, along with any necessary parents
 func createDir(dir string) error {
 	return file.MkdirAll(dir, 0700)

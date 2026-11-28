@@ -191,6 +191,7 @@ type VFS struct {
 	pollMu      sync.Mutex
 	pollChan    chan time.Duration
 	inUse       atomic.Int32 // count of number of opens
+	MountPoint  string       // the mount point path, empty if not a FUSE mount
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)

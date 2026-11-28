@@ -509,7 +509,16 @@ func TestFileStatusPrefetchFailureClearsAfterSuccessfulRetry(t *testing.T) {
 	assert.Equal(t, "download_failed", retried["local"])
 
 	fixture.control.clearDownloadPlan(name)
-	got, err := fixture.vfs.ReadFile(name)
+	deadline := time.Now().Add(fileStatusFailureWaitTimeout)
+	var got []byte
+	var err error
+	for {
+		got, err = fixture.vfs.ReadFile(name)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	require.NoError(t, err)
 	assert.Equal(t, content, string(got))
 	recovered := fileStatusFailureResult(t, r, fixture, path)

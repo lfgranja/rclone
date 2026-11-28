@@ -596,6 +596,7 @@ func arrangeFileStatusStateRemoteFile(t *testing.T, r *fstest.Run, vfs *VFS, nam
 func arrangeFileStatusStateCachedFile(t *testing.T, r *fstest.Run, vfs *VFS, name, content string) string {
 	t.Helper()
 	r.WriteObject(context.Background(), name, content, t1)
+	listFileStatusStateRoot(t, vfs) // the new object must be visible before the mount reads it
 	readFileStatusStateThrough(t, vfs, name, content)
 	listFileStatusStateRoot(t, vfs) // refresh directory cache
 	return fileStatusStatePath(r, name)

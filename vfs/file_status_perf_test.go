@@ -747,6 +747,7 @@ func fileStatusAssertPerPathResults(t *testing.T, out rc.Params, paths []string)
 // scheduled requests, and the pass rule is applied per
 // run with every run passing.
 func TestFileStatusPerfSingleReadLatency(t *testing.T) {
+	fileStatusRequirePerf(t)
 	r, vfs, call := fileStatusNewRun(t, "vfs/file-status")
 	const mountName = "/single-read.txt"
 	payload := []byte("single-read state payload")
@@ -789,6 +790,7 @@ func TestFileStatusPerfSingleReadLatency(t *testing.T) {
 // path more than once, so the same-path-requested-
 // repeatedly clause is covered too.
 func TestFileStatusPerfConcurrentOracle(t *testing.T) {
+	fileStatusRequirePerf(t)
 	r, _, call := rcNewRun(t, "vfs/file-status")
 	distinct := make([]string, fileStatusOraclePaths)
 	for i := range distinct {
@@ -845,6 +847,7 @@ func TestFileStatusPerfConcurrentOracle(t *testing.T) {
 // quietly. Peak CPU utilization per run is reported
 // alongside the latency.
 func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the under-load matrix in short mode")
 	}
@@ -1081,6 +1084,7 @@ func TestFileStatusPerfLatencyUnderLoad(t *testing.T) {
 // transfer chunks landed during the run and at least one
 // reset engaged.
 func TestFileStatusPerfConcurrentOracleUnderLoad(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the under-load concurrency oracle in short mode")
 	}

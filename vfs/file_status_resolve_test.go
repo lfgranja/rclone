@@ -232,7 +232,7 @@ func TestFileStatusResolveFinalSymlinkIsNotFollowed(t *testing.T) {
 		t.Skipf("cannot create file symlink: %v", err)
 	}
 	RegisterMountPointForVFS(vfs, mountPoint)
-	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, mountPoint) })
+	t.Cleanup(func() { UnregisterMountPointForVFS(vfs, "") })
 
 	result := fileStatusResolvePath(t, call, filepath.Join(mountPoint, "link"))
 	assert.Equal(t, "not_regular_file", result["local"], "the final component is the VFS symlink itself")

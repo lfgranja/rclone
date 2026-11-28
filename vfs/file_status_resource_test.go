@@ -1335,8 +1335,13 @@ func TestFileStatusPerfCPUUnderLoad(t *testing.T) {
 func fileStatusTeardownWSSPoint(t *testing.T, vfs *VFS) {
 	t.Helper()
 	UnregisterMountPointForVFS(vfs, "")
-	require.NoError(t, vfs.CleanUp(), "tearing down a WSS/MRC point")
-	vfs.Shutdown()
+	// The reference count records whether this point still owns the
+	// VFS, so the test-end cleanup releases it exactly once.
+	err := vfs.CleanUp()
+	if vfs.inUse.Load() > 0 {
+		vfs.Shutdown()
+	}
+	require.NoError(t, err, "tearing down a WSS/MRC point")
 	fileStatusSettleRSS()
 }
 

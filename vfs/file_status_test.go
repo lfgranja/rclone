@@ -132,7 +132,7 @@ func TestFileStatusNonAbsoluteEntry(t *testing.T) {
 		{"relative entry", []string{"file.txt"}},
 		{"dot relative entry", []string{"./file.txt"}},
 		{"parent relative entry", []string{"../file.txt"}},
-		{"absolute and relative entries", []string{"/file.txt", "dir/file.txt"}},
+		{"absolute and relative entries", []string{fileStatusAbsTestPath("file.txt"), "dir/file.txt"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -160,7 +160,7 @@ func TestFileStatusNonStringEntry(t *testing.T) {
 		{"number entry", []any{42}},
 		{"boolean entry", []any{true}},
 		{"null entry", []any{nil}},
-		{"string and number entries", []any{"/file.txt", 42}},
+		{"string and number entries", []any{fileStatusAbsTestPath("file.txt"), 42}},
 		{"relative string and number entries", []any{"file.txt", 42}},
 	}
 	for _, test := range tests {
@@ -183,7 +183,7 @@ func TestFileStatusUnknownParameterIgnored(t *testing.T) {
 
 	in := rc.Params{
 		"fs":      fsName,
-		"paths":   []string{"/no/such/mount/point/file.txt"},
+		"paths":   []string{fileStatusAbsTestPath("no", "such", "mount", "point", "file.txt")},
 		"unknown": "ignored",
 	}
 	out, err := call.Fn(context.Background(), in)
@@ -211,7 +211,7 @@ func TestFileStatusFsIdentifierResolution(t *testing.T) {
 	_, _, call := rcNewRun(t, "vfs/file-status")
 
 	t.Run("unmatched identifier", func(t *testing.T) {
-		in := rc.Params{"fs": "no-such-mount", "paths": []string{"/file.txt"}}
+		in := rc.Params{"fs": "no-such-mount", "paths": []string{fileStatusAbsTestPath("file.txt")}}
 		out, err := call.Fn(context.Background(), in)
 		require.Error(t, err)
 		requireWholeRequestRejection(t, err, "no_active_mount")
@@ -219,7 +219,7 @@ func TestFileStatusFsIdentifierResolution(t *testing.T) {
 	})
 
 	t.Run("no identifier several paths", func(t *testing.T) {
-		in := rc.Params{"paths": []string{"/one/file.txt", "/two/file.txt"}}
+		in := rc.Params{"paths": []string{fileStatusAbsTestPath("one", "file.txt"), fileStatusAbsTestPath("two", "file.txt")}}
 		out, err := call.Fn(context.Background(), in)
 		require.Error(t, err)
 		requireWholeRequestRejection(t, err, "ambiguous_mount")
@@ -227,7 +227,7 @@ func TestFileStatusFsIdentifierResolution(t *testing.T) {
 	})
 
 	t.Run("no identifier single path", func(t *testing.T) {
-		path := "/no/such/mount/point/file.txt"
+		path := fileStatusAbsTestPath("no", "such", "mount", "point", "file.txt")
 		in := rc.Params{"paths": []string{path}}
 		out, err := call.Fn(context.Background(), in)
 		require.NoError(t, err)
@@ -275,13 +275,13 @@ func TestFileStatusNoActiveMount(t *testing.T) {
 		// points, and with no mount active it is outside every mount
 		// (mirrors TestFileStatusDecisionOutsideAnyMount
 		// single-path-with-no-mount-active).
-		in := rc.Params{"paths": []string{"/file.txt"}}
+		in := rc.Params{"paths": []string{fileStatusAbsTestPath("file.txt")}}
 		out, err := call.Fn(context.Background(), in)
 		require.NoError(t, err)
 		requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
 		// An identifier matching no running mount is the whole-request
 		// no_active_mount failure.
-		inUnmatched := rc.Params{"fs": "no-such-mount", "paths": []string{"/file.txt"}}
+		inUnmatched := rc.Params{"fs": "no-such-mount", "paths": []string{fileStatusAbsTestPath("file.txt")}}
 		outUnmatched, errUnmatched := call.Fn(context.Background(), inUnmatched)
 		require.Error(t, errUnmatched)
 		requireWholeRequestRejection(t, errUnmatched, "no_active_mount")
@@ -360,7 +360,7 @@ func TestFileStatusClassifiesArbitraryPaths(t *testing.T) {
 	absolute := func(paths []string) bool {
 		absolutePaths := make([]string, len(paths))
 		for i, path := range paths {
-			absolutePaths[i] = "/" + path
+			absolutePaths[i] = fileStatusAbsTestPath(path)
 		}
 		return request(absolutePaths)
 	}
@@ -423,19 +423,19 @@ func TestFileStatusHTTPDelivery(t *testing.T) {
 	})
 
 	t.Run("non-string entry", func(t *testing.T) {
-		requireRejection(t, rc.Params{"fs": fsName, "paths": []any{"/file.txt", 42}}, "param_invalid")
+		requireRejection(t, rc.Params{"fs": fsName, "paths": []any{fileStatusAbsTestPath("file.txt"), 42}}, "param_invalid")
 	})
 
 	t.Run("unmatched identifier", func(t *testing.T) {
-		requireRejection(t, rc.Params{"fs": "no-such-mount", "paths": []string{"/file.txt"}}, "no_active_mount")
+		requireRejection(t, rc.Params{"fs": "no-such-mount", "paths": []string{fileStatusAbsTestPath("file.txt")}}, "no_active_mount")
 	})
 
 	t.Run("no identifier several paths", func(t *testing.T) {
-		requireRejection(t, rc.Params{"paths": []string{"/one/file.txt", "/two/file.txt"}}, "ambiguous_mount")
+		requireRejection(t, rc.Params{"paths": []string{fileStatusAbsTestPath("one", "file.txt"), fileStatusAbsTestPath("two", "file.txt")}}, "ambiguous_mount")
 	})
 
 	t.Run("valid request answered per path", func(t *testing.T) {
-		body := fileStatusJSONBody(t, rc.Params{"fs": fsName, "paths": []string{"/no/such/mount/point/file.txt"}})
+		body := fileStatusJSONBody(t, rc.Params{"fs": fsName, "paths": []string{fileStatusAbsTestPath("no", "such", "mount", "point", "file.txt")}})
 		resp, raw, decoded := fileStatusHTTPPost(t, testURL, body, "application/json", "", "")
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", raw)
 		require.NotNil(t, decoded, "body: %s", raw)
@@ -560,7 +560,7 @@ func TestFileStatusWholeRequestDeliveryProperty(t *testing.T) {
 	check := func(c fileStatusWholeRequestCase) bool {
 		in := rc.Params{}
 		if c.NonString {
-			in["paths"] = []any{"/file.txt", 42}
+			in["paths"] = []any{fileStatusAbsTestPath("file.txt"), 42}
 		} else {
 			in["paths"] = c.Paths
 		}

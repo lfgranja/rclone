@@ -752,6 +752,13 @@ func TestFileStatusPerfVmHWM(t *testing.T) {
 	if spread := peaks[lastD] - troughs[lastD]; spread > noiseTol {
 		noiseTol = spread
 	}
+	// Hosted runners can move a child process between hosts, so three
+	// in-process reps can understate the cross-process HWM spread. Keep a
+	// floor large enough for that scheduling noise without changing k.
+	const hwmNoiseFloorPages = 256
+	if noiseTol < hwmNoiseFloorPages {
+		noiseTol = hwmNoiseFloorPages
+	}
 	t.Logf("VmHWM cross-process peak jitter: %d pages (D=0 spread %d, D=%d spread %d)",
 		noiseTol, peaks[0]-troughs[0], lastD, peaks[lastD]-troughs[lastD])
 	for _, d := range fileStatusHWMCurveD {

@@ -163,6 +163,20 @@ func writeError(path string, in rc.Params, w http.ResponseWriter, err error, sta
 	}
 }
 
+// writeFileStatusError writes the response for a call handler
+// that rejected the whole request with a *rc.FileStatusError:
+// the status the error carries and the error object of the
+// endpoint's contract, which has no path field.
+func writeFileStatusError(path string, w http.ResponseWriter, err *rc.FileStatusError) {
+	fs.Errorf(nil, "rc: %q: error: %v", path, err)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(err.Status)
+	if jsonErr := rc.WriteJSON(w, err.Render()); jsonErr != nil {
+		// can't return the error at this point
+		fs.Errorf(nil, "rc: writeFileStatusError: failed to write JSON output: %v", jsonErr)
+	}
+}
+
 // handler reads incoming requests and dispatches them
 func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimLeft(r.URL.Path, "/")
@@ -271,6 +285,15 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		w.Header().Add("x-rclone-jobid", fmt.Sprintf("%d", job.ID))
 	}
 	if err != nil {
+		// A handler rejecting the whole request with a typed
+		// FileStatusError answers with the status and error
+		// object its contract prescribes, so return here
+		// rather than mapping it through the rc server error
+		// mapping and the trailing write below.
+		if statusErr, ok := err.(*rc.FileStatusError); ok {
+			writeFileStatusError(path, w, statusErr)
+			return
+		}
 		writeError(path, inOrig, w, err, http.StatusInternalServerError)
 		return
 	}

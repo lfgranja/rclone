@@ -52,7 +52,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -1091,8 +1090,10 @@ func TestFileStatusPerfCPUUnderLoad(t *testing.T) {
 	// thread alone.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	tid := syscall.Gettid()
-	require.Greater(t, tid, 0, "no thread id for the request goroutine")
+	tid := fileStatusThreadID()
+	if tid <= 0 {
+		t.Skip("per-thread CPU clock requires Linux /proc/self/task")
+	}
 	fileStatusCheckThreadCPUClock(t, tid)
 
 	// Quiescent baseline q1: median of 3 rounds of the size-1

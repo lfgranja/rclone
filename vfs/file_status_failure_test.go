@@ -463,7 +463,19 @@ func TestFileStatusPartialDownloadFailureClearsAfterSuccessfulRetry(t *testing.T
 	requireFileStatusFailureByte(t, failed, "total_size", int64(len(content)))
 
 	fixture.control.clearDownloadPlan(name)
-	got, err := fixture.vfs.ReadFile(name)
+	// A download already scheduled before the plan was cleared can still
+	// deliver the injected error once; the contract under test is that a
+	// later successful read clears the recorded failure.
+	deadline := time.Now().Add(fileStatusFailureWaitTimeout)
+	var got []byte
+	var err error
+	for {
+		got, err = fixture.vfs.ReadFile(name)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	require.NoError(t, err)
 	assert.Equal(t, content, string(got))
 	recovered := fileStatusFailureResult(t, r, fixture, path)

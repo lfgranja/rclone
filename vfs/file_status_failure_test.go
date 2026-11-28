@@ -269,6 +269,7 @@ func (fixture *fileStatusFailureFixture) start(t *testing.T, opt *vfscommon.Opti
 func (fixture *fileStatusFailureFixture) restart(t *testing.T, opt *vfscommon.Options) {
 	t.Helper()
 	UnregisterMountPointForVFS(fixture.vfs, fixture.remote.Root())
+	fixture.vfs.WaitForWriters(waitForWritersDelay)
 	fixture.vfs.Shutdown()
 	fixture.vfs = nil
 	fixture.start(t, opt)
@@ -282,8 +283,10 @@ func (fixture *fileStatusFailureFixture) close(t *testing.T) {
 	vfs := fixture.vfs
 	fixture.vfs = nil
 	UnregisterMountPointForVFS(vfs, fixture.remote.Root())
+	vfs.WaitForWriters(waitForWritersDelay)
+	err := vfs.CleanUp()
 	vfs.Shutdown()
-	require.NoError(t, vfs.CleanUp())
+	require.NoError(t, err)
 }
 
 func fileStatusFailureResult(t *testing.T, r *fstest.Run, fixture *fileStatusFailureFixture, path string) map[string]any {

@@ -58,10 +58,10 @@ func RegisterMountPoint(name, mountPoint string) {
 	canonicalizeMountPointLocked(mountPoint)
 }
 
-// canonicalizeMountPointLocked records the symlink-resolved form of a
-// registered mount point. Callers must hold mountPointsMu. Unresolvable
-// paths (e.g. VFS-only paths absent from the host) keep their lexical
-// form and are retried on a later registration.
+// canonicalizeMountPointLocked records the resolved form of a registered
+// mount point, including points whose leaf directory does not exist on the
+// host. Callers must hold mountPointsMu. An ancestor that cannot be
+// resolved leaves the point unrecorded for a later registration.
 func canonicalizeMountPointLocked(mountPoint string) {
 	cleanPoint := filepath.Clean(mountPoint)
 	if cleanPoint == "." {
@@ -70,11 +70,11 @@ func canonicalizeMountPointLocked(mountPoint string) {
 	if _, ok := mountPointCanonical[cleanPoint]; ok {
 		return
 	}
-	resolvedPoint, err := filepath.EvalSymlinks(cleanPoint)
-	if err != nil {
+	resolvedPoint, ok := resolveExistingPath(cleanPoint)
+	if !ok {
 		return
 	}
-	mountPointCanonical[cleanPoint] = filepath.Clean(resolvedPoint)
+	mountPointCanonical[cleanPoint] = resolvedPoint
 }
 
 // UnregisterMountPoint removes a mount point registration for a VFS.
@@ -1307,20 +1307,14 @@ func sameMountPoint(a, b string) bool {
 	return resolvedA == resolvedB
 }
 
-// resolvePathForMatching resolves parent symlinks without following the
-// final component, so a path reaching a mount through a linked parent
-// is answered by that mount. It returns the resolved
-// path for mount matching; false means a dangling parent link names
-// nothing reachable (outside_any_mount). Non-existent VFS-only
-// intermediates are kept lexically so virtual paths still match.
-func resolvePathForMatching(requestPath string) (string, bool) {
-	cleaned := filepath.Clean(requestPath)
-	parent := filepath.Dir(cleaned)
-	base := filepath.Base(cleaned)
-	if parent == cleaned {
-		return cleaned, true
-	}
-	candidate := parent
+// resolveExistingPath resolves path through symlinks even when its final
+// components are absent from the host. It evaluates the deepest existing
+// ancestor and reapplies the missing components, giving a virtual mount
+// point the same canonical form as paths beneath it. False means an
+// existing ancestor cannot be resolved.
+func resolveExistingPath(path string) (string, bool) {
+	cleaned := filepath.Clean(path)
+	candidate := cleaned
 	var remainder []string
 	for {
 		if _, err := os.Lstat(candidate); err == nil {
@@ -1339,11 +1333,29 @@ func resolvePathForMatching(requestPath string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	resolvedParent := resolvedCandidate
 	for _, part := range remainder {
-		resolvedParent = filepath.Join(resolvedParent, part)
+		resolvedCandidate = filepath.Join(resolvedCandidate, part)
 	}
-	return filepath.Clean(filepath.Join(resolvedParent, base)), true
+	return resolvedCandidate, true
+}
+
+// resolvePathForMatching resolves parent symlinks without following the
+// final component, so a path reaching a mount through a linked parent
+// is answered by that mount. It returns the resolved
+// path for mount matching; false means a dangling parent link names
+// nothing reachable (outside_any_mount). Non-existent VFS-only
+// intermediates are kept lexically so virtual paths still match.
+func resolvePathForMatching(requestPath string) (string, bool) {
+	cleaned := filepath.Clean(requestPath)
+	parent := filepath.Dir(cleaned)
+	if parent == cleaned {
+		return cleaned, true
+	}
+	resolvedParent, ok := resolveExistingPath(parent)
+	if !ok {
+		return "", false
+	}
+	return filepath.Clean(filepath.Join(resolvedParent, filepath.Base(cleaned))), true
 }
 
 // classifyPath classifies a single path against a VFS and its matched

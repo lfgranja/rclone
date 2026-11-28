@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +67,17 @@ func fileStatusRejectionCode(err error) string {
 	}
 	code, _, _ := strings.Cut(err.Error(), ": ")
 	return code
+}
+
+// fileStatusAbsTestPath builds an absolute host path from its
+// components. Endpoint paths in this package must be absolute on the
+// host running the tests: a POSIX literal is relative on Windows and
+// takes empty_path before any mount is consulted.
+func fileStatusAbsTestPath(elem ...string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(append([]string{"C:\\"}, elem...)...)
+	}
+	return filepath.Join(append([]string{string(filepath.Separator)}, elem...)...)
 }
 
 // requirePerPathError asserts that the endpoint returned a
@@ -226,7 +238,7 @@ func TestFileStatusDecisionRequestShape(t *testing.T) {
 	})
 
 	t.Run("paths is not an array", func(t *testing.T) {
-		in := rc.Params{"paths": "/not/an/array"}
+		in := rc.Params{"paths": "not-an-array"}
 		_, err := call.Fn(context.Background(), in)
 		requireRejection(t, err, "param_invalid")
 	})
@@ -246,7 +258,7 @@ func TestFileStatusDecisionNoActiveMount(t *testing.T) {
 		// outside every mount.
 		in := rc.Params{
 			"fs":    "no-such-mount",
-			"paths": []string{"/no/such/path"},
+			"paths": []string{fileStatusAbsTestPath("no", "such", "path")},
 		}
 		_, err := call.Fn(context.Background(), in)
 		requireRejection(t, err, "no_active_mount")
@@ -258,7 +270,7 @@ func TestFileStatusDecisionNoActiveMount(t *testing.T) {
 		// identifier.
 		in := rc.Params{
 			"fs":    "mydrive[1]",
-			"paths": []string{"/no/such/path"},
+			"paths": []string{fileStatusAbsTestPath("no", "such", "path")},
 		}
 		_, err := call.Fn(context.Background(), in)
 		requireRejection(t, err, "no_active_mount")
@@ -268,7 +280,7 @@ func TestFileStatusDecisionNoActiveMount(t *testing.T) {
 		withEmptyActiveMap(t, func() {
 			in := rc.Params{
 				"fs":    "no-such-mount",
-				"paths": []string{"/no/such/path"},
+				"paths": []string{fileStatusAbsTestPath("no", "such", "path")},
 			}
 			_, err := call.Fn(context.Background(), in)
 			requireRejection(t, err, "no_active_mount")
@@ -298,7 +310,7 @@ func TestFileStatusDecisionOutsideAnyMount(t *testing.T) {
 
 	t.Run("single path with no mount active", func(t *testing.T) {
 		withEmptyActiveMap(t, func() {
-			in := rc.Params{"paths": []string{"/no/such/mount/point/file.txt"}}
+			in := rc.Params{"paths": []string{fileStatusAbsTestPath("no", "such", "mount", "point", "file.txt")}}
 			out, err := call.Fn(context.Background(), in)
 			require.NoError(t, err)
 			requirePerPathError(t, out, in["paths"].([]string)[0], "outside_any_mount")
@@ -323,7 +335,7 @@ func TestFileStatusDecisionOutsideAnyMount(t *testing.T) {
 		r, _ := newTestVFS(t)
 		in := rc.Params{
 			"fs":    fs.ConfigString(r.Fremote),
-			"paths": []string{"/no/such/mount/point/file.txt"},
+			"paths": []string{fileStatusAbsTestPath("no", "such", "mount", "point", "file.txt")},
 		}
 		out, err := call.Fn(context.Background(), in)
 		require.NoError(t, err)
@@ -340,14 +352,14 @@ func TestFileStatusDecisionAmbiguousMount(t *testing.T) {
 	require.NotNil(t, call)
 
 	t.Run("multiple paths with no identifier", func(t *testing.T) {
-		in := rc.Params{"paths": []string{"/no/such/path/one", "/no/such/path/two"}}
+		in := rc.Params{"paths": []string{fileStatusAbsTestPath("no", "such", "path", "one"), fileStatusAbsTestPath("no", "such", "path", "two")}}
 		_, err := call.Fn(context.Background(), in)
 		requireRejection(t, err, "ambiguous_mount")
 	})
 
 	t.Run("multiple paths with no identifier and no mount active", func(t *testing.T) {
 		withEmptyActiveMap(t, func() {
-			in := rc.Params{"paths": []string{"/no/such/path/one", "/no/such/path/two"}}
+			in := rc.Params{"paths": []string{fileStatusAbsTestPath("no", "such", "path", "one"), fileStatusAbsTestPath("no", "such", "path", "two")}}
 			_, err := call.Fn(context.Background(), in)
 			requireRejection(t, err, "ambiguous_mount")
 		})
@@ -409,9 +421,9 @@ func TestFileStatusDecisionMountUnreachableNotEndpointCode(t *testing.T) {
 		{},
 		{"paths": []string{}},
 		{"paths": []string{"relative/file"}},
-		{"paths": []string{"/no/such/path"}},
-		{"paths": []string{"/no/such/path/one", "/no/such/path/two"}},
-		{"fs": "no-such-mount", "paths": []string{"/no/such/path"}},
+		{"paths": []string{fileStatusAbsTestPath("no", "such", "path")}},
+		{"paths": []string{fileStatusAbsTestPath("no", "such", "path", "one"), fileStatusAbsTestPath("no", "such", "path", "two")}},
+		{"fs": "no-such-mount", "paths": []string{fileStatusAbsTestPath("no", "such", "path")}},
 		{"paths": []any{42}},
 	}
 	for _, in := range requests {
@@ -469,9 +481,9 @@ func TestFileStatusDecisionDeterminismConcurrent(t *testing.T) {
 		{"paths": []string{"relative/file"}, "fs": "no-such-mount"},
 		{"paths": []string{filepath.Join(dir, "no-such-file.txt")}},
 		{"paths": []string{filepath.Join(dangling, "file.txt")}},
-		{"paths": []string{"/no/such/path/one", "/no/such/path/two"}},
-		{"fs": "no-such-mount", "paths": []string{"/no/such/path/one", "/no/such/path/two"}},
-		{"fs": "mydrive[1]", "paths": []string{"/no/such/path"}},
+		{"paths": []string{fileStatusAbsTestPath("no", "such", "path", "one"), fileStatusAbsTestPath("no", "such", "path", "two")}},
+		{"fs": "no-such-mount", "paths": []string{fileStatusAbsTestPath("no", "such", "path", "one"), fileStatusAbsTestPath("no", "such", "path", "two")}},
+		{"fs": "mydrive[1]", "paths": []string{fileStatusAbsTestPath("no", "such", "path")}},
 		{"paths": []any{42}},
 	}
 

@@ -511,7 +511,6 @@ func TestFileStatusPrefetchFailureClearsAfterSuccessfulRetry(t *testing.T) {
 	fixture.control.clearDownloadPlan(name)
 	deadline := time.Now().Add(fileStatusFailureWaitTimeout)
 	var got []byte
-	var err error
 	for {
 		got, err = fixture.vfs.ReadFile(name)
 		if err == nil || time.Now().After(deadline) {

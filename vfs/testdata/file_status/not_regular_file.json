@@ -1,0 +1,14 @@
+{
+  "statuses": [
+    {
+      "path": "/mnt/test/link",
+      "local": "not_regular_file",
+      "upload": "not_applicable",
+      "bytes": {
+        "unbroken_run": "not_measurable",
+        "total_held": "not_measurable",
+        "total_size": "not_measurable"
+      }
+    }
+  ]
+}

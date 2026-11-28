@@ -1,0 +1,14 @@
+{
+  "statuses": [
+    {
+      "path": "/mnt/test/file.txt",
+      "local": "partly_held",
+      "upload": "awaiting_upload",
+      "bytes": {
+        "unbroken_run": 512,
+        "total_held": 512,
+        "total_size": 1024
+      }
+    }
+  ]
+}

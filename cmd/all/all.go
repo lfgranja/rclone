@@ -81,4 +81,5 @@ import (
 	_ "github.com/rclone/rclone/cmd/touch"
 	_ "github.com/rclone/rclone/cmd/tree"
 	_ "github.com/rclone/rclone/cmd/version"
+	_ "github.com/rclone/rclone/cmd/vfs/status"
 )

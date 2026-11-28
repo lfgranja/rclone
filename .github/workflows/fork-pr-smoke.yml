@@ -1,0 +1,14 @@
+name: fork-pr-smoke
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke
+        run: echo "pull_request trigger ok"

@@ -220,7 +220,9 @@ func stopRc(_ context.Context, in rc.Params) (out rc.Params, err error) {
 		return nil, fmt.Errorf("server with id=%q not found", id)
 	}
 	err = s.h.Shutdown()
-	_ = <-s.errChan // the server error is usually "use of closed network connection"
+	if shutdownErr := <-s.errChan; shutdownErr != nil {
+		fs.Debugf(nil, "rc server shutdown: %v", shutdownErr)
+	}
 	delete(servers, id)
 	return nil, err
 }
@@ -356,7 +358,9 @@ func stopAll(_ context.Context, in rc.Params) (out rc.Params, err error) {
 	ec := errcount.New()
 	for id, s := range servers {
 		ec.Add(s.h.Shutdown())
-		_ = <-s.errChan // the server error is usually "use of closed network connection"
+		if shutdownErr := <-s.errChan; shutdownErr != nil {
+			fs.Debugf(nil, "rc server shutdown: %v", shutdownErr)
+		}
 		delete(servers, id)
 	}
 	return nil, ec.Err("error when stopping server")

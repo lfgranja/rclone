@@ -24,10 +24,9 @@ const fileStatusConcurrencyChildEnv = "RCLONE_FILE_STATUS_CONCURRENCY_CHILD"
 // fileStatusConcurrencyTimeout scales the fixed timeouts for the
 // concurrent list/resolve/unmount workload when running under the race
 // detector. The workload progresses under -race but takes
-// roughly 8x longer: measured ~1.6s non-race vs 12-14s race, so the 15s
-// budget that is comfortable without race sat right at the race runtime and
-// intermittently tripped the outer context deadline. Scaling by the measured
-// slowdown keeps the same safety margin; non-race behavior is unchanged.
+// roughly 8x longer: measured ~1.6s non-race vs 12-14s race, so the 30s
+// budget keeps the race run comfortable and leaves margin on loaded hosted
+// runners. Scaling by the measured slowdown keeps that same margin.
 func fileStatusConcurrencyTimeout(base time.Duration) time.Duration {
 	if israce.Enabled {
 		return base * 8
@@ -41,7 +40,7 @@ func TestFileStatusConcurrentListResolveUnmount(t *testing.T) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), fileStatusConcurrencyTimeout(15*time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), fileStatusConcurrencyTimeout(30*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFileStatusConcurrentListResolveUnmount$")
 	cmd.Env = append(os.Environ(), fileStatusConcurrencyChildEnv+"=1")

@@ -67,14 +67,15 @@ func canonicalizeMountPointLocked(mountPoint string) {
 	if cleanPoint == "." {
 		return
 	}
-	if _, ok := mountPointCanonical[cleanPoint]; ok {
+	key := normalizeExtendedPath(cleanPoint)
+	if _, ok := mountPointCanonical[key]; ok {
 		return
 	}
 	resolvedPoint, ok := resolveExistingPath(cleanPoint)
 	if !ok {
 		return
 	}
-	mountPointCanonical[cleanPoint] = resolvedPoint
+	mountPointCanonical[key] = normalizeExtendedPath(resolvedPoint)
 }
 
 // UnregisterMountPoint removes a mount point registration for a VFS.
@@ -1235,10 +1236,38 @@ func parseIndexedName(name string) (string, int) {
 	return name, -1
 }
 
+// normalizeExtendedPath removes the Windows extended-length device prefix
+// so paths resolved through symlinks and paths supplied by callers share
+// one comparison form. A \\?\C:\x path becomes C:\x, and a
+// \\?\UNC\server\share path becomes \\server\share, which keeps real UNC
+// paths intact. Both the native and the slash form returned by
+// local.Root are accepted. On other platforms the path is unchanged.
+func normalizeExtendedPath(path string) string {
+	if runtime.GOOS != "windows" {
+		return path
+	}
+	var rest string
+	switch {
+	case strings.HasPrefix(path, `\\?\`):
+		rest = path[len(`\\?\`):]
+	case strings.HasPrefix(path, `//?/`):
+		rest = path[len(`//?/`):]
+	default:
+		return path
+	}
+	rest = filepath.FromSlash(rest)
+	if len(rest) > 3 && strings.EqualFold(rest[:3], "unc") && rest[3] == '\\' {
+		return `\\` + rest[4:]
+	}
+	return rest
+}
+
 // isPathInsideMountPoint checks if path is inside mountPoint (at component boundary).
 // Matching is case-insensitive on Windows and case-sensitive elsewhere,
 // with boundary awareness so a sibling sharing the prefix is outside.
 func isPathInsideMountPoint(path, mountPoint string) bool {
+	path = normalizeExtendedPath(path)
+	mountPoint = normalizeExtendedPath(mountPoint)
 	if runtime.GOOS == "windows" {
 		if strings.EqualFold(path, mountPoint) {
 			return true
@@ -1275,7 +1304,7 @@ func matchMountPoint(path, mountPoint string) (string, bool) {
 	if mountPoint == "" {
 		return "", false
 	}
-	cleanPoint := filepath.Clean(mountPoint)
+	cleanPoint := normalizeExtendedPath(filepath.Clean(mountPoint))
 	if isPathInsideMountPoint(path, cleanPoint) {
 		return cleanPoint, true
 	}
@@ -1291,7 +1320,8 @@ func matchMountPoint(path, mountPoint string) (string, bool) {
 // sameMountPoint reports whether two registered paths name the same
 // mount, comparing the canonical forms recorded at registration.
 func sameMountPoint(a, b string) bool {
-	cleanA, cleanB := filepath.Clean(a), filepath.Clean(b)
+	cleanA := normalizeExtendedPath(filepath.Clean(a))
+	cleanB := normalizeExtendedPath(filepath.Clean(b))
 	if cleanA == cleanB {
 		return true
 	}
@@ -1394,7 +1424,7 @@ func classifyPath(vfsInstance *VFS, vfsName, mountPoint, path string, hasFsParam
 
 	// Get the relative path within the mount from the resolved path so
 	// an alias parent still maps to the entry it serves.
-	relPath, err := filepath.Rel(cleanMP, resolvedPath)
+	relPath, err := filepath.Rel(normalizeExtendedPath(cleanMP), normalizeExtendedPath(resolvedPath))
 	if err != nil {
 		return buildErrorResult(path, "outside_any_mount", "path is not relative to mount point")
 	}

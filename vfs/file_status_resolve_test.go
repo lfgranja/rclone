@@ -58,7 +58,7 @@ func TestFileStatusResolveCleanCollapse(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		assert.Equal(t, `C:\mnt`, filepath.Clean(`C:\mnt\.\`))
 		assert.Equal(t, `C:\y`, filepath.Clean(`C:\mnt\..\y`))
-		assert.Equal(t, `\\server\y`, filepath.Clean(`\\server\share\..\y`))
+		assert.Equal(t, `\\server\share\y`, filepath.Clean(`\\server\share\..\y`))
 	}
 }
 

@@ -752,9 +752,9 @@ func TestFileStatusPerfVmHWM(t *testing.T) {
 	if spread := peaks[lastD] - troughs[lastD]; spread > noiseTol {
 		noiseTol = spread
 	}
-	// Hosted runners can move a child process between hosts, so three
-	// in-process reps can understate the cross-process HWM spread. Keep a
-	// floor large enough for that scheduling noise without changing k.
+	// Separate child processes start with different allocator and runtime
+	// states, so three in-process reps can understate the cross-process HWM
+	// spread. Keep a floor large enough for that variance without changing k.
 	const hwmNoiseFloorPages = 256
 	if noiseTol < hwmNoiseFloorPages {
 		noiseTol = hwmNoiseFloorPages

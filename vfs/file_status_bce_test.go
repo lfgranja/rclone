@@ -35,8 +35,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
@@ -125,6 +125,9 @@ func bceNormalizePaths(doc map[string]any, mountPoint string) map[string]any {
 	return normalised
 }
 
+// bceRewritePaths maps a live mount point prefix to the "/mnt/test"
+// placeholder, using "/" for every separator so the rewritten path matches
+// the POSIX fixtures on every platform.
 func bceRewritePaths(v any, mountPoint string) {
 	switch node := v.(type) {
 	case map[string]any:
@@ -135,7 +138,8 @@ func bceRewritePaths(v any, mountPoint string) {
 					if clean == mountPoint {
 						node[key] = "/mnt/test"
 					} else if len(clean) > len(mountPoint) && clean[:len(mountPoint)] == mountPoint && clean[len(mountPoint)] == filepath.Separator {
-						node[key] = "/mnt/test" + clean[len(mountPoint):]
+						suffix := strings.ReplaceAll(clean[len(mountPoint):], string(filepath.Separator), "/")
+						node[key] = "/mnt/test" + suffix
 					}
 				}
 				continue

@@ -57,6 +57,9 @@ func TestMain(m *testing.M) {
 	}
 	defer func() { _ = os.RemoveAll(binDir) }()
 	rcloneBin = filepath.Join(binDir, "rclone")
+	if runtime.GOOS == "windows" {
+		rcloneBin += ".exe"
+	}
 
 	build := exec.Command(goBin, "build", "-o", rcloneBin, ".")
 	build.Dir = repoRoot

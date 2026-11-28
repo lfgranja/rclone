@@ -154,6 +154,12 @@ var fileStatusLoadMatrix = []fileStatusLoadPoint{
 	{mountSize: 100, queryRate: 100},
 }
 
+// fileStatusPerfEnv is the opt-in for the performance and
+// resource measurements. Shared hosted runners perturb
+// their timing and page-count oracles, so the functional
+// suite stays deterministic without them.
+const fileStatusPerfEnv = "RCLONE_VFS_PERF_TESTS"
+
 // fileStatusRequireLinux skips the calling test on hosts
 // without the Linux procfs the resource measurement is
 // defined against. The skip names what is missing
@@ -165,6 +171,17 @@ func fileStatusRequireLinux(t *testing.T) {
 	}
 	if _, err := os.Stat("/proc/self/statm"); err != nil {
 		t.Skipf("resource measurement needs /proc/self/statm: %v", err)
+	}
+}
+
+// fileStatusRequirePerf skips the calling test unless
+// fileStatusPerfEnv is set to 1. The performance oracles
+// depend on timing and page counts that shared runners
+// perturb; opting in runs the full measurement.
+func fileStatusRequirePerf(t *testing.T) {
+	t.Helper()
+	if os.Getenv(fileStatusPerfEnv) != "1" {
+		t.Skipf("set %s=1 to run the performance measurement", fileStatusPerfEnv)
 	}
 }
 
@@ -486,6 +503,7 @@ func fileStatusWaitCleanAll(t *testing.T, vfs *VFS, names []string, timeout time
 // the mount's file count and proportionality to the
 // response size are shown independently.
 func TestFileStatusPerfDeltaM(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the ΔM matrix in short mode")
 	}
@@ -548,6 +566,7 @@ func TestFileStatusPerfDeltaM(t *testing.T) {
 // mount process (the isolation the criterion prefers) instead
 // of pretending the mark was reset.
 func TestFileStatusPerfClearRefsKeepsHWM(t *testing.T) {
+	fileStatusRequirePerf(t)
 	fileStatusRequireLinux(t)
 	before, err := fileStatusVMHWM()
 	require.NoError(t, err)
@@ -610,6 +629,7 @@ func TestFileStatusPerfClearRefsKeepsHWM(t *testing.T) {
 // RCLONE_FILE_STATUS_HWM_POINT set; an ordinary run
 // skips it.
 func TestFileStatusPerfVmHWMPoint(t *testing.T) {
+	fileStatusRequirePerf(t)
 	dStr := os.Getenv("RCLONE_FILE_STATUS_HWM_POINT")
 	if dStr == "" {
 		t.Skip("HWM curve-point driver: run via TestFileStatusPerfVmHWM")
@@ -688,6 +708,7 @@ func fileStatusRunHWMPoint(t *testing.T, d int) (hwm int64, pid int) {
 // jitter-dominated deltas). k stays 128 and the C₀ +
 // k·D model is unchanged.
 func TestFileStatusPerfVmHWM(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the VmHWM matrix in short mode")
 	}
@@ -810,6 +831,7 @@ func TestFileStatusPerfVmHWM(t *testing.T) {
 // measured in interleaved rounds and the whole curve is
 // calibrated by a pilot, all recorded.
 func TestFileStatusPerfCPU(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the CPU matrix in short mode")
 	}
@@ -1052,6 +1074,7 @@ func TestFileStatusPerfCPU(t *testing.T) {
 // host at or below its CPU count always enforces the
 // bound.
 func TestFileStatusPerfCPUUnderLoad(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the CPU-under-load matrix in short mode")
 	}
@@ -1391,6 +1414,7 @@ func fileStatusSettleRSS() {
 // ≤21 pages, transient peak ≤60. The curve values are
 // still recorded per point.
 func TestFileStatusPerfWSSMRC(t *testing.T) {
+	fileStatusRequirePerf(t)
 	if testing.Short() {
 		t.Skip("skipping the WSS/MRC matrix in short mode")
 	}
@@ -1683,6 +1707,7 @@ func TestFileStatusPerfWSSMRC(t *testing.T) {
 // totals, state flags) so the warm steady-state read
 // allocates zero, and tighten this bound back to zero.
 func TestFileStatusPerfAllocsWarmHeld(t *testing.T) {
+	fileStatusRequirePerf(t)
 	r, vfs, _ := fileStatusNewRunFull(t, "vfs/file-status")
 	const mountName = "/allocs-warm.bin"
 	const cachePath = "allocs-warm.bin"
@@ -1745,6 +1770,7 @@ func fileStatusAllocsPathResolution(hostPath string) float64 {
 // one-result-object-per-path rules always hold and are
 // asserted before any skip.
 func TestFileStatusPerfAllocsPerResult(t *testing.T) {
+	fileStatusRequirePerf(t)
 	r, vfs, call := fileStatusNewRunFull(t, "vfs/file-status")
 	const files = 8
 	mountNames := make([]string, 0, files)
@@ -1838,6 +1864,7 @@ func TestFileStatusPerfAllocsPerResult(t *testing.T) {
 // zero-alloc steady-state rule. The test asserts the
 // setup cost is real (cold ≥ warm) and finite.
 func TestFileStatusPerfAllocsCold(t *testing.T) {
+	fileStatusRequirePerf(t)
 	r, vfs, call := fileStatusNewRunFull(t, "vfs/file-status")
 	// Distinct files, placed directly on the remote BEFORE
 	// anything lists the mount, so the mount holds no

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -72,7 +73,14 @@ type Downloaders struct {
 	waiters    []waiter
 	errorCount int   // number of consecutive errors
 	lastErr    error // last error received
+
+	// statusErr publishes the accumulated error for status reads,
+	// which hold the item lock while downloaders hold dls.mu.
+	statusErr atomic.Pointer[downloaderStatusError]
 }
+
+// downloaderStatusError wraps the error published for status reads.
+type downloaderStatusError struct{ err error }
 
 // waiter is a range we are waiting for and a channel to signal when
 // the range is found
@@ -149,6 +157,7 @@ func (dls *Downloaders) _countErrors(n int64, err error) {
 			dls.errorCount = 0
 			dls.lastErr = nil
 		}
+		dls.statusErr.Store(nil)
 		return
 	}
 	if err != nil {
@@ -156,6 +165,7 @@ func (dls *Downloaders) _countErrors(n int64, err error) {
 		dls.errorCount++
 		//}
 		dls.lastErr = err
+		dls.statusErr.Store(&downloaderStatusError{err: err})
 		fs.Infof(dls.src, "vfs cache: downloader: error count now %d: %v", dls.errorCount, err)
 	}
 }
@@ -265,7 +275,13 @@ func (dls *Downloaders) Download(r ranges.Range) (err error) {
 
 	dls.waiters = append(dls.waiters, waiter)
 	dls.mu.Unlock()
-	return <-errChan
+	err = <-errChan
+	if err == nil {
+		// The waiter's range arrived: earlier transfer errors are
+		// cleared by the successful attempt, not by retry scheduling.
+		dls.statusErr.Store(nil)
+	}
+	return err
 }
 
 // close any waiters with the error passed in
@@ -443,6 +459,16 @@ func (dls *Downloaders) kickWaiters() (err error) {
 		return dls.lastErr
 	}
 
+	return nil
+}
+
+// LastError returns the accumulated downloader error without taking
+// dls.mu, for status reads with the item lock held. A successful
+// transfer clears it; scheduling a retry does not.
+func (dls *Downloaders) LastError() error {
+	if statusErr := dls.statusErr.Load(); statusErr != nil {
+		return statusErr.err
+	}
 	return nil
 }
 

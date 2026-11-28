@@ -24,10 +24,11 @@ func newFileStatusRegistryVFS(t *testing.T, f fs.Fs, opt *vfscommon.Options) (*V
 	shutDown := false
 	t.Cleanup(func() {
 		vfs.WaitForWriters(waitForWritersDelay)
-		require.NoError(t, vfs.CleanUp())
+		err := vfs.CleanUp()
 		if !shutDown {
 			vfs.Shutdown()
 		}
+		require.NoError(t, err)
 	})
 	return vfs, func() {
 		if !shutDown {

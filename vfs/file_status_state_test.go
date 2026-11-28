@@ -154,11 +154,12 @@ func newFileStatusStateRun(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *
 	r := fstest.NewRun(t)
 	vfs := New(context.Background(), r.Fremote, opt)
 	// The endpoint checks fs-identifier queries for containment
-	// against the VFS mount point, rejecting a VFS with
-	// none, so the harness mounts the test remote at its host
-	// root, the way newFileStatusStateRunAtRemoteRoot does.
-	vfs.MountPoint = r.Fremote.Root()
+	// against a registered mount point, rejecting a VFS with
+	// none, so the harness registers the test remote's host root
+	// as the mount point, the way newFileStatusStateRunAtRemoteRoot does.
+	RegisterMountPointForVFS(vfs, r.Fremote.Root())
 	t.Cleanup(func() {
+		UnregisterMountPointForVFS(vfs, "")
 		cleanupVFS(t, vfs)
 	})
 	call := rc.Calls.Get("vfs/file-status")
@@ -170,14 +171,14 @@ func newFileStatusStateRun(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *
 // VFS mount point so endpoint paths map directly to its listed entries.
 func newFileStatusStateRunAtRemoteRoot(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *VFS, *rc.Call) {
 	r, vfs, call := newFileStatusStateRun(t, opt)
-	vfs.MountPoint = r.Fremote.Root()
 	return r, vfs, call
 }
 
 func newFileStatusStateVFSAtRemoteRoot(t *testing.T, r *fstest.Run, remote fs.Fs, opt *vfscommon.Options) (*VFS, *rc.Call) {
 	vfs := New(context.Background(), remote, opt)
-	vfs.MountPoint = r.Fremote.Root()
+	RegisterMountPointForVFS(vfs, r.Fremote.Root())
 	t.Cleanup(func() {
+		UnregisterMountPointForVFS(vfs, "")
 		cleanupVFS(t, vfs)
 	})
 	call := rc.Calls.Get("vfs/file-status")

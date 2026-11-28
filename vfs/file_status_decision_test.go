@@ -370,7 +370,6 @@ func TestFileStatusDecisionAmbiguousMount(t *testing.T) {
 // local fact with not_measurable byte quantities, and
 // unaccountable_path.
 //
-//
 // Each needs a mount with a registered mount point
 // and is covered in the sibling suite that arranges that interior:
 // not_found and unaccountable_path in file_status_remote_test.go,

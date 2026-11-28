@@ -38,7 +38,6 @@ jobs:
           - job_name: linux
             os: ubuntu-latest
             go: '~1.27.2'
-            gotags: cmount
             build_flags: '-include "^linux/"'
             check: true
             quicktest: true

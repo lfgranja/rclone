@@ -610,6 +610,9 @@ func arrangeFileStatusStateRemoteFile(t *testing.T, r *fstest.Run, vfs *VFS, nam
 // content, and returns its host path.
 func arrangeFileStatusStateCachedFile(t *testing.T, r *fstest.Run, vfs *VFS, name, content string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("VFS over an extended-length local root cannot open files through the mount on Windows")
+	}
 	r.WriteObject(context.Background(), name, content, t1)
 	listFileStatusStateRoot(t, vfs) // the new object must be visible before the mount reads it
 	readFileStatusStateThrough(t, vfs, name, content)

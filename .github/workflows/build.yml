@@ -329,9 +329,11 @@ jobs:
           skip-cache: true
 
       - name: Install govulncheck
+        if: github.repository == 'rclone/rclone'
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Scan for vulnerabilities
+        if: github.repository == 'rclone/rclone'
         run: govulncheck ./...
 
       - name: Check Markdown format

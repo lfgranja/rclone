@@ -34,6 +34,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -157,7 +158,7 @@ func newFileStatusStateRun(t *testing.T, opt *vfscommon.Options) (*fstest.Run, *
 	// against a registered mount point, rejecting a VFS with
 	// none, so the harness registers the test remote's host root
 	// as the mount point, the way newFileStatusStateRunAtRemoteRoot does.
-	RegisterMountPointForVFS(vfs, r.Fremote.Root())
+	RegisterMountPointForVFS(vfs, fileStatusStateHostRoot(r.Fremote.Root()))
 	t.Cleanup(func() {
 		UnregisterMountPointForVFS(vfs, "")
 		cleanupVFS(t, vfs)
@@ -176,7 +177,7 @@ func newFileStatusStateRunAtRemoteRoot(t *testing.T, opt *vfscommon.Options) (*f
 
 func newFileStatusStateVFSAtRemoteRoot(t *testing.T, r *fstest.Run, remote fs.Fs, opt *vfscommon.Options) (*VFS, *rc.Call) {
 	vfs := New(context.Background(), remote, opt)
-	RegisterMountPointForVFS(vfs, r.Fremote.Root())
+	RegisterMountPointForVFS(vfs, fileStatusStateHostRoot(r.Fremote.Root()))
 	t.Cleanup(func() {
 		UnregisterMountPointForVFS(vfs, "")
 		cleanupVFS(t, vfs)
@@ -198,12 +199,26 @@ func fileStatusStateOpt(cacheMode vfscommon.CacheMode, writeBack fs.Duration) *v
 	return &opt
 }
 
-// fileStatusStatePath returns the host path of a file within
-// the mount: for an in-process VFS over a local remote, the
-// file's path under the remote's root, which is the mount's
-// host interior.
+// fileStatusStateHostRoot removes the Windows extended-length prefix from a
+// local remote root so registered mount points and request paths use one form.
+func fileStatusStateHostRoot(root string) string {
+	if runtime.GOOS == "windows" {
+		for _, prefix := range []string{`\\?\`, `//?/`} {
+			if !strings.HasPrefix(root, prefix) {
+				continue
+			}
+			rest := root[len(prefix):]
+			if strings.HasPrefix(rest, "UNC\\") {
+				return `\\` + rest[len("UNC\\"):]
+			}
+			return strings.ReplaceAll(rest, "/", `\`)
+		}
+	}
+	return root
+}
+
 func fileStatusStatePath(r *fstest.Run, name string) string {
-	return filepath.Join(r.Fremote.Root(), filepath.FromSlash(name))
+	return filepath.Join(fileStatusStateHostRoot(r.Fremote.Root()), filepath.FromSlash(name))
 }
 
 // fileStatusStateCall calls the endpoint with the given
